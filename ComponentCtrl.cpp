@@ -2,27 +2,52 @@
 #include "ComponentCtrl.h"
 
 #include <initguid.h>
-#include <winioctl.h>
 #include <setupapi.h>
-#include <cfgmgr32.h>
-#include <shellapi.h>
 #include <strsafe.h>
+#include <winioctl.h>
 #include <vector>
 #include <string>
-#include <cwchar>
+#include <cstdarg>
+
+#include <windowsx.h>
 
 #include "../aw22xxx_led/Public.h"
 
 #pragma comment(lib, "setupapi.lib")
 
-namespace {
+#define MAX_LOADSTRING 100
+#define CONFIG_TABLE_BUFFER_SIZE (64u * 1024u)
 
-std::wstring
+HINSTANCE hInst;
+WCHAR szTitle[MAX_LOADSTRING];
+WCHAR szWindowClass[MAX_LOADSTRING];
+
+struct APP_STATE {
+    HANDLE Device;
+    HWND MainWindow;
+    HWND ConfigCombo;
+    HWND ApplyButton;
+    HWND RefreshButton;
+    HWND OffButton;
+    HWND RgbCheck;
+    HWND InfoText;
+    HWND StatusText;
+    std::vector<AW22XXX_CONFIG_DESCRIPTOR> Configs;
+};
+
+static APP_STATE gAppState = { INVALID_HANDLE_VALUE };
+
+ATOM                MyRegisterClass(HINSTANCE hInstance);
+BOOL                InitInstance(HINSTANCE, int);
+LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
+INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
+
+static std::wstring
 FormatWin32Error(
     _In_ DWORD Error
     )
 {
-    wchar_t message[512];
+    WCHAR message[512];
 
     message[0] = L'\0';
     if (FormatMessageW(
@@ -34,54 +59,128 @@ FormatWin32Error(
             ARRAYSIZE(message),
             nullptr) == 0)
     {
-        StringCchPrintfW(message, ARRAYSIZE(message), L"Win32 error 0x%08lx", Error);
+        (void)StringCchPrintfW(message, ARRAYSIZE(message), L"Win32 error 0x%08lx", Error);
     }
 
     return std::wstring(message);
 }
 
-bool
-ParseUlong(
-    _In_ PCWSTR Text,
-    _Out_ ULONG* Value
+static std::wstring
+AsciiToWide(
+    _In_z_ PCSTR Text
     )
 {
-    wchar_t* endPtr;
-    unsigned long parsedValue;
+    int wideLength;
+    std::wstring result;
 
-    if ((Text == nullptr) || (Value == nullptr))
+    if (Text == nullptr)
     {
-        return false;
+        return std::wstring();
     }
 
-    endPtr = nullptr;
-    parsedValue = wcstoul(Text, &endPtr, 0);
-    if ((endPtr == Text) || (endPtr == nullptr) || (*endPtr != L'\0'))
+    wideLength = MultiByteToWideChar(CP_ACP, 0, Text, -1, nullptr, 0);
+    if (wideLength <= 1)
     {
-        return false;
+        return std::wstring();
     }
 
-    *Value = (ULONG)parsedValue;
-    return true;
+    result.resize((size_t)wideLength - 1u);
+    (void)MultiByteToWideChar(CP_ACP, 0, Text, -1, &result[0], wideLength);
+    return result;
 }
 
-void
-PrintUsage()
+static std::wstring
+FormatConfigDisplayName(
+    _In_ const AW22XXX_CONFIG_DESCRIPTOR& Config
+    )
 {
-    fwprintf(stdout,
-        L"Usage:\n"
-        L"  ComponentCtrl info\n"
-        L"  ComponentCtrl list-configs\n"
-        L"  ComponentCtrl apply-config <configId> [rgbOverride]\n"
-        L"  ComponentCtrl apply-effect <effectId> [rgbOverride]\n"
-        L"  ComponentCtrl set-imax <imaxCode>\n"
-        L"  ComponentCtrl init\n"
-        L"  ComponentCtrl off\n"
-        L"  ComponentCtrl read <page> <register>\n"
-        L"  ComponentCtrl write <page> <register> <value>\n");
+    WCHAR buffer[256];
+    std::wstring name;
+
+    name = AsciiToWide(Config.Name);
+    if (name.empty())
+    {
+        name.assign(L"<unnamed>");
+    }
+
+    (void)StringCchPrintfW(
+        buffer,
+        ARRAYSIZE(buffer),
+        L"%ls (0x%02lx)",
+        name.c_str(),
+        Config.ConfigId);
+    return std::wstring(buffer);
 }
 
-bool
+static void
+SetStatusText(
+    _In_z_ _Printf_format_string_ PCWSTR Format,
+    ...
+    )
+{
+    WCHAR buffer[512];
+    va_list args;
+
+    buffer[0] = L'\0';
+    va_start(args, Format);
+    (void)StringCchVPrintfW(buffer, ARRAYSIZE(buffer), Format, args);
+    va_end(args);
+
+    if (gAppState.StatusText != nullptr)
+    {
+        SetWindowTextW(gAppState.StatusText, buffer);
+    }
+}
+
+static void
+SetInfoText(
+    _In_z_ _Printf_format_string_ PCWSTR Format,
+    ...
+    )
+{
+    WCHAR buffer[1024];
+    va_list args;
+
+    buffer[0] = L'\0';
+    va_start(args, Format);
+    (void)StringCchVPrintfW(buffer, ARRAYSIZE(buffer), Format, args);
+    va_end(args);
+
+    if (gAppState.InfoText != nullptr)
+    {
+        SetWindowTextW(gAppState.InfoText, buffer);
+    }
+}
+
+static void
+EnableInteractiveControls(
+    _In_ BOOL EnableApply,
+    _In_ BOOL EnableDeviceActions
+    )
+{
+    if (gAppState.ConfigCombo != nullptr)
+    {
+        EnableWindow(gAppState.ConfigCombo, EnableApply);
+    }
+    if (gAppState.ApplyButton != nullptr)
+    {
+        EnableWindow(gAppState.ApplyButton, EnableApply);
+    }
+    if (gAppState.RefreshButton != nullptr)
+    {
+        EnableWindow(gAppState.RefreshButton, TRUE);
+    }
+    if (gAppState.OffButton != nullptr)
+    {
+        EnableWindow(gAppState.OffButton, EnableDeviceActions);
+    }
+    if (gAppState.RgbCheck != nullptr)
+    {
+        EnableWindow(gAppState.RgbCheck, EnableDeviceActions);
+    }
+}
+
+static BOOL
 GetFirstDevicePath(
     _Out_ std::wstring& DevicePath
     )
@@ -101,7 +200,7 @@ GetFirstDevicePath(
         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (deviceInfoSet == INVALID_HANDLE_VALUE)
     {
-        return false;
+        return FALSE;
     }
 
     interfaceData.cbSize = sizeof(interfaceData);
@@ -114,7 +213,7 @@ GetFirstDevicePath(
     if (!ok)
     {
         SetupDiDestroyDeviceInfoList(deviceInfoSet);
-        return false;
+        return FALSE;
     }
 
     requiredLength = 0;
@@ -125,11 +224,11 @@ GetFirstDevicePath(
         0,
         &requiredLength,
         nullptr);
-    if (requiredLength == 0)
+    if (requiredLength < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W))
     {
         SetupDiDestroyDeviceInfoList(deviceInfoSet);
         SetLastError(ERROR_INSUFFICIENT_BUFFER);
-        return false;
+        return FALSE;
     }
 
     detailBuffer.resize(requiredLength);
@@ -149,20 +248,36 @@ GetFirstDevicePath(
     }
 
     SetupDiDestroyDeviceInfoList(deviceInfoSet);
-    return ok ? true : false;
+    return ok;
 }
 
-HANDLE
-OpenDevice()
+static void
+CloseDeviceHandle()
+{
+    if (gAppState.Device != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(gAppState.Device);
+        gAppState.Device = INVALID_HANDLE_VALUE;
+    }
+}
+
+static BOOL
+EnsureDeviceOpen()
 {
     std::wstring devicePath;
 
-    if (!GetFirstDevicePath(devicePath))
+    if (gAppState.Device != INVALID_HANDLE_VALUE)
     {
-        return INVALID_HANDLE_VALUE;
+        return TRUE;
     }
 
-    return CreateFileW(
+    if (!GetFirstDevicePath(devicePath))
+    {
+        SetStatusText(L"Driver interface not found: %ls", FormatWin32Error(GetLastError()).c_str());
+        return FALSE;
+    }
+
+    gAppState.Device = CreateFileW(
         devicePath.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -170,11 +285,17 @@ OpenDevice()
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
+    if (gAppState.Device == INVALID_HANDLE_VALUE)
+    {
+        SetStatusText(L"Open driver failed: %ls", FormatWin32Error(GetLastError()).c_str());
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
-bool
+static BOOL
 SendIoctl(
-    _In_ HANDLE Device,
     _In_ DWORD Ioctl,
     _In_reads_bytes_opt_(InputLength) const void* InputBuffer,
     _In_ DWORD InputLength,
@@ -185,78 +306,69 @@ SendIoctl(
 {
     DWORD localBytesReturned;
 
+    if (!EnsureDeviceOpen())
+    {
+        return FALSE;
+    }
+
     localBytesReturned = 0;
     if (BytesReturned == nullptr)
     {
         BytesReturned = &localBytesReturned;
     }
 
-    return DeviceIoControl(
-        Device,
-        Ioctl,
-        const_cast<void*>(InputBuffer),
-        InputLength,
-        OutputBuffer,
-        OutputLength,
-        BytesReturned,
-        nullptr) ? true : false;
+    if (DeviceIoControl(
+            gAppState.Device,
+            Ioctl,
+            const_cast<void*>(InputBuffer),
+            InputLength,
+            OutputBuffer,
+            OutputLength,
+            BytesReturned,
+            nullptr))
+    {
+        return TRUE;
+    }
+
+    SetStatusText(L"IOCTL 0x%08lx failed: %ls", Ioctl, FormatWin32Error(GetLastError()).c_str());
+    return FALSE;
 }
 
-int
-CommandInfo(
-    _In_ HANDLE Device
+static BOOL
+FetchDeviceInformation(
+    _Out_ PAW22XXX_DEVICE_INFORMATION Information
     )
 {
-    AW22XXX_DEVICE_INFORMATION information;
     DWORD bytesReturned;
 
-    ZeroMemory(&information, sizeof(information));
+    ZeroMemory(Information, sizeof(*Information));
     if (!SendIoctl(
-            Device,
             IOCTL_AW22XXX_GET_INFORMATION,
             nullptr,
             0,
-            &information,
-            sizeof(information),
+            Information,
+            sizeof(*Information),
             &bytesReturned))
     {
-        fwprintf(stderr, L"IOCTL_AW22XXX_GET_INFORMATION failed: %ls\n", FormatWin32Error(GetLastError()).c_str());
-        return 1;
+        return FALSE;
     }
 
-    fwprintf(stdout, L"ChipId=0x%02x ChipType=%u CurrentPage=0x%02x\n",
-        information.ChipIdRegister,
-        information.ChipType,
-        information.CurrentPage);
-    fwprintf(stdout, L"Imax=0x%02x Brightness=0x%02x Task0=0x%02x Task1=0x%02x\n",
-        information.ImaxCode,
-        information.Brightness,
-        information.Task0,
-        information.Task1);
-    fwprintf(stdout, L"Flags=0x%02x Effect=%u ConfigId=0x%02lx RgbOverride=%u\n",
-        information.Flags,
-        information.Effect,
-        information.CurrentConfigId,
-        information.UseRgbOverride);
-    fwprintf(stdout, L"SequencePairLimit=%lu ConfigCount=%lu\n",
-        information.SequencePairLimit,
-        information.ConfigCount);
-    return 0;
+    return bytesReturned >= sizeof(*Information);
 }
 
-int
-CommandListConfigs(
-    _In_ HANDLE Device
+static BOOL
+FetchConfigTable(
+    _Out_ std::vector<AW22XXX_CONFIG_DESCRIPTOR>& Configs
     )
 {
     std::vector<BYTE> buffer;
     PAW22XXX_CONFIG_TABLE table;
     DWORD bytesReturned;
-    ULONG index;
+    size_t requiredSize;
 
-    buffer.resize(64 * 1024);
+    Configs.clear();
+    buffer.resize(CONFIG_TABLE_BUFFER_SIZE);
     if (!SendIoctl(
-            Device,
             IOCTL_AW22XXX_GET_CONFIG_TABLE,
             nullptr,
             0,
@@ -264,345 +376,464 @@ CommandListConfigs(
             (DWORD)buffer.size(),
             &bytesReturned))
     {
-        fwprintf(stderr, L"IOCTL_AW22XXX_GET_CONFIG_TABLE failed: %ls\n", FormatWin32Error(GetLastError()).c_str());
-        return 1;
+        return FALSE;
+    }
+
+    if (bytesReturned < sizeof(AW22XXX_CONFIG_TABLE))
+    {
+        SetStatusText(L"Config table reply too small (%lu bytes)", bytesReturned);
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
     }
 
     table = reinterpret_cast<PAW22XXX_CONFIG_TABLE>(buffer.data());
-    fwprintf(stdout, L"Version=%lu Count=%lu\n", table->Version, table->Count);
-    for (index = 0; index < table->Count; index++)
+    requiredSize = FIELD_OFFSET(AW22XXX_CONFIG_TABLE, Entries) +
+        ((size_t)table->Count * sizeof(AW22XXX_CONFIG_DESCRIPTOR));
+    if ((table->Version != AW22XXX_CONFIG_TABLE_VERSION)
+        || (requiredSize > bytesReturned)
+        || (requiredSize > buffer.size()))
     {
-        const AW22XXX_CONFIG_DESCRIPTOR& entry = table->Entries[index];
-        fwprintf(stdout,
-            L"0x%02lx  %-28hs  pairs=%-4lu  flags=0x%02lx\n",
-            entry.ConfigId,
-            entry.Name,
-            entry.PairCount,
-            entry.Flags);
+        SetStatusText(L"Config table reply invalid (version=%lu count=%lu)", table->Version, table->Count);
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
     }
 
-    return 0;
+    Configs.assign(table->Entries, table->Entries + table->Count);
+    return TRUE;
 }
 
-int
-CommandApplyConfig(
-    _In_ HANDLE Device,
-    _In_ PCWSTR ConfigIdText,
-    _In_opt_ PCWSTR RgbOverrideText
+static INT
+PopulateConfigCombo(
+    _In_ ULONG SelectedConfigId
     )
 {
-    AW22XXX_CONFIG_REQUEST request;
-    ULONG configId;
-    ULONG rgbOverride;
+    size_t index;
+    INT selectedIndex;
+    INT availableCount;
 
-    if (!ParseUlong(ConfigIdText, &configId))
+    SendMessageW(gAppState.ConfigCombo, CB_RESETCONTENT, 0, 0);
+    selectedIndex = -1;
+    availableCount = 0;
+
+    for (index = 0; index < gAppState.Configs.size(); index++)
     {
-        fwprintf(stderr, L"Invalid config id: %ls\n", ConfigIdText);
-        return 1;
+        const AW22XXX_CONFIG_DESCRIPTOR& config = gAppState.Configs[index];
+        std::wstring displayName;
+        INT comboIndex;
+
+        if ((config.Flags & AW22XXX_CONFIG_FLAG_AVAILABLE) == 0u)
+        {
+            continue;
+        }
+
+        displayName = FormatConfigDisplayName(config);
+        comboIndex = (INT)SendMessageW(gAppState.ConfigCombo, CB_ADDSTRING, 0, (LPARAM)displayName.c_str());
+        if (comboIndex < 0)
+        {
+            continue;
+        }
+
+        availableCount++;
+        SendMessageW(gAppState.ConfigCombo, CB_SETITEMDATA, (WPARAM)comboIndex, (LPARAM)config.ConfigId);
+        if (config.ConfigId == SelectedConfigId)
+        {
+            selectedIndex = comboIndex;
+        }
     }
 
-    rgbOverride = 0;
-    if ((RgbOverrideText != nullptr) && !ParseUlong(RgbOverrideText, &rgbOverride))
+    if ((selectedIndex < 0) && (SendMessageW(gAppState.ConfigCombo, CB_GETCOUNT, 0, 0) > 0))
     {
-        fwprintf(stderr, L"Invalid rgbOverride value: %ls\n", RgbOverrideText);
-        return 1;
+        selectedIndex = 0;
+    }
+    if (selectedIndex >= 0)
+    {
+        SendMessageW(gAppState.ConfigCombo, CB_SETCURSEL, (WPARAM)selectedIndex, 0);
     }
 
-    ZeroMemory(&request, sizeof(request));
-    request.ConfigId = configId;
-    request.UseRgbOverride = rgbOverride ? 1u : 0u;
-    if (!SendIoctl(
-            Device,
-            IOCTL_AW22XXX_APPLY_CONFIG,
-            &request,
-            sizeof(request),
-            nullptr,
-            0,
-            nullptr))
-    {
-        fwprintf(stderr, L"IOCTL_AW22XXX_APPLY_CONFIG failed: %ls\n", FormatWin32Error(GetLastError()).c_str());
-        return 1;
-    }
-
-    fwprintf(stdout, L"Applied config 0x%02lx (rgbOverride=%lu)\n", configId, rgbOverride);
-    return 0;
+    return availableCount;
 }
 
-int
-CommandApplyEffect(
-    _In_ HANDLE Device,
-    _In_ PCWSTR EffectIdText,
-    _In_opt_ PCWSTR RgbOverrideText
-    )
+static void
+RefreshUi()
 {
-    AW22XXX_EFFECT_REQUEST request;
-    ULONG effectId;
-    ULONG rgbOverride;
+    AW22XXX_DEVICE_INFORMATION information;
+    INT availableConfigCount;
 
-    if (!ParseUlong(EffectIdText, &effectId))
+    if (!FetchConfigTable(gAppState.Configs) || !FetchDeviceInformation(&information))
     {
-        fwprintf(stderr, L"Invalid effect id: %ls\n", EffectIdText);
-        return 1;
+        EnableInteractiveControls(FALSE, FALSE);
+        SetInfoText(L"Driver not available or not responding.");
+        return;
     }
 
-    rgbOverride = 0;
-    if ((RgbOverrideText != nullptr) && !ParseUlong(RgbOverrideText, &rgbOverride))
-    {
-        fwprintf(stderr, L"Invalid rgbOverride value: %ls\n", RgbOverrideText);
-        return 1;
-    }
+    availableConfigCount = PopulateConfigCombo(information.CurrentConfigId);
+    SendMessageW(
+        gAppState.RgbCheck,
+        BM_SETCHECK,
+        information.UseRgbOverride ? BST_CHECKED : BST_UNCHECKED,
+        0);
 
-    ZeroMemory(&request, sizeof(request));
-    request.Effect = (UCHAR)effectId;
-    request.UseRgbOverride = rgbOverride ? 1u : 0u;
-    if (!SendIoctl(
-            Device,
-            IOCTL_AW22XXX_APPLY_EFFECT,
-            &request,
-            sizeof(request),
-            nullptr,
-            0,
-            nullptr))
-    {
-        fwprintf(stderr, L"IOCTL_AW22XXX_APPLY_EFFECT failed: %ls\n", FormatWin32Error(GetLastError()).c_str());
-        return 1;
-    }
+    SetInfoText(
+        L"Chip ID: 0x%02x\r\n"
+        L"Chip Type: %u\r\n"
+        L"Selected Config: 0x%02lx\r\n"
+        L"Available Configs: %lu / %zu\r\n"
+        L"IMAX: 0x%02x\r\n"
+        L"Tasks: 0x%02x / 0x%02x\r\n"
+        L"Flags: 0x%02x",
+        information.ChipIdRegister,
+        information.ChipType,
+        information.CurrentConfigId,
+        (ULONG)availableConfigCount,
+        gAppState.Configs.size(),
+        information.ImaxCode,
+        information.Task0,
+        information.Task1,
+        information.Flags);
 
-    fwprintf(stdout, L"Applied effect 0x%02lx (rgbOverride=%lu)\n", effectId, rgbOverride);
-    return 0;
-}
-
-int
-CommandSetImax(
-    _In_ HANDLE Device,
-    _In_ PCWSTR ImaxText
-    )
-{
-    AW22XXX_IMAX_REQUEST request;
-    ULONG imaxCode;
-
-    if (!ParseUlong(ImaxText, &imaxCode))
+    if (availableConfigCount > 0)
     {
-        fwprintf(stderr, L"Invalid IMAX code: %ls\n", ImaxText);
-        return 1;
-    }
-
-    ZeroMemory(&request, sizeof(request));
-    request.ImaxCode = (UCHAR)imaxCode;
-    if (!SendIoctl(Device, IOCTL_AW22XXX_SET_IMAX, &request, sizeof(request), nullptr, 0, nullptr))
-    {
-        fwprintf(stderr, L"IOCTL_AW22XXX_SET_IMAX failed: %ls\n", FormatWin32Error(GetLastError()).c_str());
-        return 1;
-    }
-
-    fwprintf(stdout, L"Set IMAX to 0x%02lx\n", imaxCode);
-    return 0;
-}
-
-int
-CommandRead(
-    _In_ HANDLE Device,
-    _In_ PCWSTR PageText,
-    _In_ PCWSTR RegisterText
-    )
-{
-    AW22XXX_REGISTER_ACCESS request;
-    AW22XXX_REGISTER_ACCESS response;
-    ULONG page;
-    ULONG reg;
-    DWORD bytesReturned;
-
-    if (!ParseUlong(PageText, &page) || !ParseUlong(RegisterText, &reg))
-    {
-        fwprintf(stderr, L"Invalid page/register\n");
-        return 1;
-    }
-
-    ZeroMemory(&request, sizeof(request));
-    ZeroMemory(&response, sizeof(response));
-    request.Page = (UCHAR)page;
-    request.Register = (UCHAR)reg;
-    if (!SendIoctl(
-            Device,
-            IOCTL_AW22XXX_READ_REGISTER,
-            &request,
-            sizeof(request),
-            &response,
-            sizeof(response),
-            &bytesReturned))
-    {
-        fwprintf(stderr, L"IOCTL_AW22XXX_READ_REGISTER failed: %ls\n", FormatWin32Error(GetLastError()).c_str());
-        return 1;
-    }
-
-    fwprintf(stdout, L"page=0x%02x reg=0x%02x value=0x%02x\n", response.Page, response.Register, response.Value);
-    return 0;
-}
-
-int
-CommandWrite(
-    _In_ HANDLE Device,
-    _In_ PCWSTR PageText,
-    _In_ PCWSTR RegisterText,
-    _In_ PCWSTR ValueText
-    )
-{
-    AW22XXX_REGISTER_ACCESS request;
-    ULONG page;
-    ULONG reg;
-    ULONG value;
-
-    if (!ParseUlong(PageText, &page)
-        || !ParseUlong(RegisterText, &reg)
-        || !ParseUlong(ValueText, &value))
-    {
-        fwprintf(stderr, L"Invalid page/register/value\n");
-        return 1;
-    }
-
-    ZeroMemory(&request, sizeof(request));
-    request.Page = (UCHAR)page;
-    request.Register = (UCHAR)reg;
-    request.Value = (UCHAR)value;
-    if (!SendIoctl(Device, IOCTL_AW22XXX_WRITE_REGISTER, &request, sizeof(request), nullptr, 0, nullptr))
-    {
-        fwprintf(stderr, L"IOCTL_AW22XXX_WRITE_REGISTER failed: %ls\n", FormatWin32Error(GetLastError()).c_str());
-        return 1;
-    }
-
-    fwprintf(stdout, L"Wrote page=0x%02lx reg=0x%02lx value=0x%02lx\n", page, reg, value);
-    return 0;
-}
-
-} // namespace
-
-int APIENTRY
-wmain(
-    _In_ int Argc,
-    _In_reads_(Argc) PWSTR* Argv
-    )
-{
-    HANDLE device;
-    std::wstring command;
-    int exitCode;
-
-    if (Argc < 2)
-    {
-        PrintUsage();
-        return 1;
-    }
-
-    command.assign(Argv[1]);
-    for (wchar_t& ch : command)
-    {
-        ch = (wchar_t)towlower(ch);
-    }
-
-    if ((command == L"help") || (command == L"--help") || (command == L"-h"))
-    {
-        PrintUsage();
-        return 0;
-    }
-
-    device = OpenDevice();
-    if (device == INVALID_HANDLE_VALUE)
-    {
-        fwprintf(stderr, L"Failed to open AW22XXX device: %ls\n", FormatWin32Error(GetLastError()).c_str());
-        return 1;
-    }
-
-    exitCode = 0;
-    if (command == L"info")
-    {
-        exitCode = CommandInfo(device);
-    }
-    else if (command == L"list-configs")
-    {
-        exitCode = CommandListConfigs(device);
-    }
-    else if (command == L"apply-config")
-    {
-        if ((Argc < 3) || (Argc > 4))
-        {
-            PrintUsage();
-            exitCode = 1;
-        }
-        else
-        {
-            exitCode = CommandApplyConfig(device, Argv[2], (Argc > 3) ? Argv[3] : nullptr);
-        }
-    }
-    else if (command == L"apply-effect")
-    {
-        if ((Argc < 3) || (Argc > 4))
-        {
-            PrintUsage();
-            exitCode = 1;
-        }
-        else
-        {
-            exitCode = CommandApplyEffect(device, Argv[2], (Argc > 3) ? Argv[3] : nullptr);
-        }
-    }
-    else if (command == L"set-imax")
-    {
-        if (Argc != 3)
-        {
-            PrintUsage();
-            exitCode = 1;
-        }
-        else
-        {
-            exitCode = CommandSetImax(device, Argv[2]);
-        }
-    }
-    else if (command == L"off")
-    {
-        if (!SendIoctl(device, IOCTL_AW22XXX_LED_OFF, nullptr, 0, nullptr, 0, nullptr))
-        {
-            fwprintf(stderr, L"IOCTL_AW22XXX_LED_OFF failed: %ls\n", FormatWin32Error(GetLastError()).c_str());
-            exitCode = 1;
-        }
-    }
-    else if (command == L"init")
-    {
-        if (!SendIoctl(device, IOCTL_AW22XXX_INITIALIZE, nullptr, 0, nullptr, 0, nullptr))
-        {
-            fwprintf(stderr, L"IOCTL_AW22XXX_INITIALIZE failed: %ls\n", FormatWin32Error(GetLastError()).c_str());
-            exitCode = 1;
-        }
-    }
-    else if (command == L"read")
-    {
-        if (Argc != 4)
-        {
-            PrintUsage();
-            exitCode = 1;
-        }
-        else
-        {
-            exitCode = CommandRead(device, Argv[2], Argv[3]);
-        }
-    }
-    else if (command == L"write")
-    {
-        if (Argc != 5)
-        {
-            PrintUsage();
-            exitCode = 1;
-        }
-        else
-        {
-            exitCode = CommandWrite(device, Argv[2], Argv[3], Argv[4]);
-        }
+        SetStatusText(L"Ready");
+        EnableInteractiveControls(TRUE, TRUE);
     }
     else
     {
-        fwprintf(stderr, L"Unknown command: %ls\n", Argv[1]);
-        PrintUsage();
-        exitCode = 1;
+        SetStatusText(L"Driver responded, but no available configs are present.");
+        EnableInteractiveControls(FALSE, TRUE);
+    }
+}
+
+static void
+ApplySelectedConfig()
+{
+    AW22XXX_CONFIG_REQUEST request;
+    LRESULT selectedIndex;
+    LRESULT configId;
+
+    selectedIndex = SendMessageW(gAppState.ConfigCombo, CB_GETCURSEL, 0, 0);
+    if (selectedIndex == CB_ERR)
+    {
+        SetStatusText(L"No config selected.");
+        return;
     }
 
-    CloseHandle(device);
-    return exitCode;
+    configId = SendMessageW(gAppState.ConfigCombo, CB_GETITEMDATA, (WPARAM)selectedIndex, 0);
+    if (configId == CB_ERR)
+    {
+        SetStatusText(L"Selected config has no id.");
+        return;
+    }
+
+    ZeroMemory(&request, sizeof(request));
+    request.ConfigId = (ULONG)configId;
+    request.UseRgbOverride =
+        (SendMessageW(gAppState.RgbCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1u : 0u;
+
+    if (!SendIoctl(IOCTL_AW22XXX_APPLY_CONFIG, &request, sizeof(request), nullptr, 0, nullptr))
+    {
+        return;
+    }
+
+    SetStatusText(L"Applied config 0x%02lx.", request.ConfigId);
+    RefreshUi();
+}
+
+static void
+TurnLedsOff()
+{
+    if (!SendIoctl(IOCTL_AW22XXX_LED_OFF, nullptr, 0, nullptr, 0, nullptr))
+    {
+        return;
+    }
+
+    SetStatusText(L"LED output disabled.");
+    RefreshUi();
+}
+
+static void
+CreateMainControls(
+    _In_ HWND Window
+    )
+{
+    (void)CreateWindowExW(
+        0,
+        L"STATIC",
+        L"Config:",
+        WS_CHILD | WS_VISIBLE,
+        16,
+        18,
+        64,
+        20,
+        Window,
+        nullptr,
+        hInst,
+        nullptr);
+
+    gAppState.ConfigCombo = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        L"COMBOBOX",
+        nullptr,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST,
+        84,
+        14,
+        320,
+        320,
+        Window,
+        (HMENU)IDC_CONFIG_COMBO,
+        hInst,
+        nullptr);
+
+    gAppState.ApplyButton = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Apply",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        416,
+        14,
+        104,
+        28,
+        Window,
+        (HMENU)IDC_APPLY_BUTTON,
+        hInst,
+        nullptr);
+
+    gAppState.RefreshButton = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Refresh",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        416,
+        52,
+        104,
+        28,
+        Window,
+        (HMENU)IDC_REFRESH_BUTTON,
+        hInst,
+        nullptr);
+
+    gAppState.OffButton = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Off",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        416,
+        90,
+        104,
+        28,
+        Window,
+        (HMENU)IDC_OFF_BUTTON,
+        hInst,
+        nullptr);
+
+    gAppState.RgbCheck = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Use RGB override",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        84,
+        52,
+        200,
+        24,
+        Window,
+        (HMENU)IDC_RGB_CHECK,
+        hInst,
+        nullptr);
+
+    gAppState.InfoText = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        L"STATIC",
+        L"",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        16,
+        90,
+        388,
+        124,
+        Window,
+        (HMENU)IDC_INFO_TEXT,
+        hInst,
+        nullptr);
+
+    gAppState.StatusText = CreateWindowExW(
+        0,
+        L"STATIC",
+        L"Connecting...",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        16,
+        226,
+        504,
+        20,
+        Window,
+        (HMENU)IDC_STATUS_TEXT,
+        hInst,
+        nullptr);
+}
+
+int APIENTRY
+wWinMain(
+    _In_ HINSTANCE hInstance,
+    _In_opt_ HINSTANCE hPrevInstance,
+    _In_ LPWSTR lpCmdLine,
+    _In_ int nCmdShow
+    )
+{
+    MSG msg;
+    HACCEL hAccelTable;
+
+    UNREFERENCED_PARAMETER(hPrevInstance);
+    UNREFERENCED_PARAMETER(lpCmdLine);
+
+    LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
+    LoadStringW(hInstance, IDC_COMPONENTCTRL, szWindowClass, MAX_LOADSTRING);
+    MyRegisterClass(hInstance);
+
+    if (!InitInstance(hInstance, nCmdShow))
+    {
+        return FALSE;
+    }
+
+    hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_COMPONENTCTRL));
+    while (GetMessageW(&msg, nullptr, 0, 0))
+    {
+        if (!TranslateAcceleratorW(msg.hwnd, hAccelTable, &msg))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    return (int)msg.wParam;
+}
+
+ATOM
+MyRegisterClass(
+    HINSTANCE hInstance
+    )
+{
+    WNDCLASSEXW wcex;
+
+    ZeroMemory(&wcex, sizeof(wcex));
+    wcex.cbSize = sizeof(wcex);
+    wcex.style = CS_HREDRAW | CS_VREDRAW;
+    wcex.lpfnWndProc = WndProc;
+    wcex.hInstance = hInstance;
+    wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_COMPONENTCTRL));
+    wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcex.lpszMenuName = MAKEINTRESOURCEW(IDC_COMPONENTCTRL);
+    wcex.lpszClassName = szWindowClass;
+    wcex.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL));
+
+    return RegisterClassExW(&wcex);
+}
+
+BOOL
+InitInstance(
+    HINSTANCE hInstance,
+    int nCmdShow
+    )
+{
+    HWND hWnd;
+
+    hInst = hInstance;
+    hWnd = CreateWindowW(
+        szWindowClass,
+        szTitle,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT,
+        0,
+        552,
+        300,
+        nullptr,
+        nullptr,
+        hInstance,
+        nullptr);
+    if (hWnd == nullptr)
+    {
+        return FALSE;
+    }
+
+    gAppState.MainWindow = hWnd;
+    ShowWindow(hWnd, nCmdShow);
+    UpdateWindow(hWnd);
+    return TRUE;
+}
+
+LRESULT CALLBACK
+WndProc(
+    HWND hWnd,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam
+    )
+{
+    UNREFERENCED_PARAMETER(lParam);
+
+    switch (message)
+    {
+    case WM_CREATE:
+        CreateMainControls(hWnd);
+        EnableInteractiveControls(FALSE, FALSE);
+        RefreshUi();
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam))
+        {
+        case IDC_APPLY_BUTTON:
+            ApplySelectedConfig();
+            return 0;
+
+        case IDC_REFRESH_BUTTON:
+            CloseDeviceHandle();
+            RefreshUi();
+            return 0;
+
+        case IDC_OFF_BUTTON:
+            TurnLedsOff();
+            return 0;
+
+        case IDM_ABOUT:
+            DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
+            return 0;
+
+        case IDM_EXIT:
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        break;
+
+    case WM_DESTROY:
+        CloseDeviceHandle();
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+INT_PTR CALLBACK
+About(
+    HWND hDlg,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam
+    )
+{
+    UNREFERENCED_PARAMETER(lParam);
+
+    switch (message)
+    {
+    case WM_INITDIALOG:
+        return (INT_PTR)TRUE;
+
+    case WM_COMMAND:
+        if ((LOWORD(wParam) == IDOK) || (LOWORD(wParam) == IDCANCEL))
+        {
+            EndDialog(hDlg, LOWORD(wParam));
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+
+    return (INT_PTR)FALSE;
 }
