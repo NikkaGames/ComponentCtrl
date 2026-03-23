@@ -2,8 +2,6 @@
 #include "ComponentCtrl.h"
 
 #include <initguid.h>
-#include <cfgmgr32.h>
-#include <hidsdi.h>
 #include <setupapi.h>
 #include <strsafe.h>
 #include <winioctl.h>
@@ -17,14 +15,8 @@
 #include "../TouchScreen/inc/common.h"
 
 #pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "cfgmgr32.lib")
-#pragma comment(lib, "hid.lib")
-
 #define MAX_LOADSTRING 100
 #define CONFIG_TABLE_BUFFER_SIZE (64u * 1024u)
-#define GOODIX_TOUCH_VID 0xDEED
-#define GOODIX_TOUCH_PID 0xFEED
-#define GOODIX_TOUCH_HARDWARE_ID L"ACPI\\GTX09916"
 #define GOODIX_REPORT_RATE_120HZ 0
 #define GOODIX_REPORT_RATE_240HZ 1
 #define GOODIX_REPORT_RATE_360HZ 2
@@ -58,6 +50,8 @@ ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
+static BOOL         GetTouchDevicePath(_Out_ std::wstring& DevicePath);
+static BOOL         EnsureTouchDeviceOpen();
 
 static std::wstring
 FormatWin32Error(
@@ -351,201 +345,45 @@ EnsureDeviceOpen()
 }
 
 static BOOL
-MultiSzContainsString(
-    _In_reads_bytes_(BufferLength) const BYTE* Buffer,
-    _In_ DWORD BufferLength,
-    _In_z_ PCWSTR Needle
-    )
-{
-    const WCHAR* current;
-    size_t remainingChars;
-
-    if ((Buffer == nullptr) || (BufferLength < sizeof(WCHAR)) || (Needle == nullptr))
-    {
-        return FALSE;
-    }
-
-    current = reinterpret_cast<const WCHAR*>(Buffer);
-    remainingChars = BufferLength / sizeof(WCHAR);
-
-    while ((remainingChars > 1) && (*current != L'\0'))
-    {
-        if (_wcsicmp(current, Needle) == 0)
-        {
-            return TRUE;
-        }
-
-        size_t currentLength = wcslen(current);
-        if (currentLength + 1 > remainingChars)
-        {
-            break;
-        }
-
-        current += currentLength + 1;
-        remainingChars -= currentLength + 1;
-    }
-
-    return FALSE;
-}
-
-static BOOL
-TouchDeviceInstanceMatches(
-    _In_ DEVINST DeviceInstance
-    )
-{
-    DEVINST currentDevice = DeviceInstance;
-
-    for (;;)
-    {
-        WCHAR instanceId[MAX_DEVICE_ID_LEN];
-        ULONG requiredLength;
-        CONFIGRET configStatus;
-
-        if (CM_Get_Device_IDW(currentDevice, instanceId, ARRAYSIZE(instanceId), 0) == CR_SUCCESS)
-        {
-            if (wcsstr(instanceId, GOODIX_TOUCH_HARDWARE_ID) != nullptr)
-            {
-                return TRUE;
-            }
-        }
-
-        requiredLength = 0;
-        configStatus = CM_Get_DevNode_Registry_PropertyW(
-            currentDevice,
-            CM_DRP_HARDWAREID,
-            nullptr,
-            nullptr,
-            &requiredLength,
-            0);
-        if ((configStatus == CR_BUFFER_SMALL) && (requiredLength >= sizeof(WCHAR)))
-        {
-            std::vector<BYTE> hardwareIds(requiredLength);
-            if (CM_Get_DevNode_Registry_PropertyW(
-                    currentDevice,
-                    CM_DRP_HARDWAREID,
-                    nullptr,
-                    hardwareIds.data(),
-                    &requiredLength,
-                    0) == CR_SUCCESS)
-            {
-                if (MultiSzContainsString(hardwareIds.data(), requiredLength, GOODIX_TOUCH_HARDWARE_ID))
-                {
-                    return TRUE;
-                }
-            }
-        }
-
-        configStatus = CM_Get_Parent(&currentDevice, currentDevice, 0);
-        if (configStatus != CR_SUCCESS)
-        {
-            break;
-        }
-    }
-
-    return FALSE;
-}
-
-static BOOL
 ReadTouchReportRateLevel(
     _Out_ ULONG* ReportRateLevel
     )
 {
-    HDEVINFO deviceInfoSet;
-    SP_DEVINFO_DATA deviceInfoData;
-    DWORD index;
-    BOOL found;
+    GOODIX_TOUCH_REPORT_RATE_STATE state;
+    DWORD bytesReturned;
 
     *ReportRateLevel = GOODIX_REPORT_RATE_240HZ;
 
-    deviceInfoSet = SetupDiGetClassDevsW(
-        nullptr,
-        nullptr,
-        nullptr,
-        DIGCF_PRESENT | DIGCF_ALLCLASSES);
-    if (deviceInfoSet == INVALID_HANDLE_VALUE)
+    if (!EnsureTouchDeviceOpen())
     {
         return FALSE;
     }
 
-    found = FALSE;
-    deviceInfoData.cbSize = sizeof(deviceInfoData);
-    for (index = 0; SetupDiEnumDeviceInfo(deviceInfoSet, index, &deviceInfoData); index++)
-    {
-        DWORD requiredLength = 0;
-        DWORD propertyType = 0;
-
-        (void)SetupDiGetDeviceRegistryPropertyW(
-            deviceInfoSet,
-            &deviceInfoData,
-            SPDRP_HARDWAREID,
-            &propertyType,
+    ZeroMemory(&state, sizeof(state));
+    bytesReturned = 0;
+    if (!DeviceIoControl(
+            gAppState.TouchDevice,
+            IOCTL_GOODIX_TOUCH_GET_REPORT_RATE,
             nullptr,
             0,
-            &requiredLength);
-
-        if ((requiredLength == 0) || (propertyType != REG_MULTI_SZ))
-        {
-            continue;
-        }
-
-        std::vector<BYTE> hardwareIds(requiredLength);
-        if (!SetupDiGetDeviceRegistryPropertyW(
-                deviceInfoSet,
-                &deviceInfoData,
-                SPDRP_HARDWAREID,
-                &propertyType,
-                hardwareIds.data(),
-                requiredLength,
-                nullptr))
-        {
-            continue;
-        }
-
-        if (!MultiSzContainsString(hardwareIds.data(), requiredLength, GOODIX_TOUCH_HARDWARE_ID))
-        {
-            continue;
-        }
-
-        HKEY deviceKey = SetupDiOpenDevRegKey(
-            deviceInfoSet,
-            &deviceInfoData,
-            DICS_FLAG_GLOBAL,
-            0,
-            DIREG_DEV,
-            KEY_READ);
-        if (deviceKey != INVALID_HANDLE_VALUE)
-        {
-            DWORD valueType = 0;
-            DWORD value = GOODIX_REPORT_RATE_240HZ;
-            DWORD valueSize = sizeof(value);
-
-            if ((RegQueryValueExW(
-                    deviceKey,
-                    L"ReportRateLevel",
-                    nullptr,
-                    &valueType,
-                    reinterpret_cast<LPBYTE>(&value),
-                    &valueSize) == ERROR_SUCCESS)
-                && (valueType == REG_DWORD)
-                && (valueSize == sizeof(value)))
-            {
-                *ReportRateLevel = value;
-            }
-
-            RegCloseKey(deviceKey);
-        }
-
-        found = TRUE;
-        break;
-    }
-
-    SetupDiDestroyDeviceInfoList(deviceInfoSet);
-    if (!found)
+            &state,
+            sizeof(state),
+            &bytesReturned,
+            nullptr))
     {
-        SetLastError(ERROR_NOT_FOUND);
+        SetStatusText(L"Read touch report rate failed: %ls", FormatWin32Error(GetLastError()).c_str());
+        return FALSE;
     }
 
-    return found;
+    if (bytesReturned < sizeof(state))
+    {
+        SetStatusText(L"Touch report rate reply too small (%lu bytes)", bytesReturned);
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
+
+    *ReportRateLevel = state.PersistentLevel;
+    return TRUE;
 }
 
 static BOOL
@@ -553,17 +391,16 @@ GetTouchDevicePath(
     _Out_ std::wstring& DevicePath
     )
 {
-    GUID hidGuid;
     HDEVINFO deviceInfoSet;
     SP_DEVICE_INTERFACE_DATA interfaceData;
-    SP_DEVINFO_DATA deviceInfoData;
-    DWORD index;
-    BOOL found;
+    DWORD requiredLength;
+    std::vector<BYTE> detailBuffer;
+    PSP_DEVICE_INTERFACE_DETAIL_DATA_W detailData;
+    BOOL ok;
 
     DevicePath.clear();
-    HidD_GetHidGuid(&hidGuid);
     deviceInfoSet = SetupDiGetClassDevsW(
-        &hidGuid,
+        &GUID_DEVINTERFACE_GOODIX_TOUCH_CONTROL,
         nullptr,
         nullptr,
         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -572,59 +409,52 @@ GetTouchDevicePath(
         return FALSE;
     }
 
-    found = FALSE;
     interfaceData.cbSize = sizeof(interfaceData);
-    deviceInfoData.cbSize = sizeof(deviceInfoData);
-    for (index = 0; SetupDiEnumDeviceInterfaces(deviceInfoSet, nullptr, &hidGuid, index, &interfaceData); index++)
+    ok = SetupDiEnumDeviceInterfaces(
+        deviceInfoSet,
+        nullptr,
+        &GUID_DEVINTERFACE_GOODIX_TOUCH_CONTROL,
+        0,
+        &interfaceData);
+    if (!ok)
     {
-        DWORD requiredLength = 0;
-        std::vector<BYTE> detailBuffer;
-        PSP_DEVICE_INTERFACE_DETAIL_DATA_W detailData;
+        SetupDiDestroyDeviceInfoList(deviceInfoSet);
+        return FALSE;
+    }
 
-        (void)SetupDiGetDeviceInterfaceDetailW(
-            deviceInfoSet,
-            &interfaceData,
-            nullptr,
-            0,
-            &requiredLength,
-            &deviceInfoData);
-        if (requiredLength < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W))
-        {
-            continue;
-        }
+    requiredLength = 0;
+    (void)SetupDiGetDeviceInterfaceDetailW(
+        deviceInfoSet,
+        &interfaceData,
+        nullptr,
+        0,
+        &requiredLength,
+        nullptr);
+    if (requiredLength < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W))
+    {
+        SetupDiDestroyDeviceInfoList(deviceInfoSet);
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
 
-        detailBuffer.resize(requiredLength);
-        detailData = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(detailBuffer.data());
-        detailData->cbSize = sizeof(*detailData);
+    detailBuffer.resize(requiredLength);
+    detailData = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(detailBuffer.data());
+    detailData->cbSize = sizeof(*detailData);
 
-        if (!SetupDiGetDeviceInterfaceDetailW(
-                deviceInfoSet,
-                &interfaceData,
-                detailData,
-                requiredLength,
-                nullptr,
-                &deviceInfoData))
-        {
-            continue;
-        }
-
-        if (!TouchDeviceInstanceMatches(deviceInfoData.DevInst))
-        {
-            continue;
-        }
-
+    ok = SetupDiGetDeviceInterfaceDetailW(
+        deviceInfoSet,
+        &interfaceData,
+        detailData,
+        requiredLength,
+        nullptr,
+        nullptr);
+    if (ok)
+    {
         DevicePath.assign(detailData->DevicePath);
-        found = TRUE;
-        break;
     }
 
     SetupDiDestroyDeviceInfoList(deviceInfoSet);
-    if (!found)
-    {
-        SetLastError(ERROR_NOT_FOUND);
-    }
-
-    return found;
+    return ok;
 }
 
 static BOOL
@@ -711,7 +541,8 @@ ApplyTouchReportRate(
     _In_ ULONG ReportRateLevel
     )
 {
-    HIDMINI_CONTROL_INFO controlInfo;
+    GOODIX_REPORT_RATE_CONTROL controlInfo;
+    DWORD bytesReturned;
 
     if (!EnsureTouchDeviceOpen())
     {
@@ -719,11 +550,18 @@ ApplyTouchReportRate(
     }
 
     ZeroMemory(&controlInfo, sizeof(controlInfo));
-    controlInfo.ReportId = CONTROL_COLLECTION_REPORT_ID;
-    controlInfo.ControlCode = HIDMINI_CONTROL_CODE_SET_REPORT_RATE;
-    controlInfo.u.ReportRate.Level = ReportRateLevel;
+    controlInfo.Level = ReportRateLevel;
+    bytesReturned = 0;
 
-    if (!HidD_SetFeature(gAppState.TouchDevice, &controlInfo, sizeof(controlInfo)))
+    if (!DeviceIoControl(
+            gAppState.TouchDevice,
+            IOCTL_GOODIX_TOUCH_SET_REPORT_RATE,
+            &controlInfo,
+            sizeof(controlInfo),
+            nullptr,
+            0,
+            &bytesReturned,
+            nullptr))
     {
         SetStatusText(L"Set touch report rate failed: %ls", FormatWin32Error(GetLastError()).c_str());
         return FALSE;
