@@ -391,6 +391,16 @@ GetTouchDevicePath(
     _Out_ std::wstring& DevicePath
     )
 {
+    DevicePath.assign(GOODIX_TOUCH_CONTROL_WIN32_PATH);
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+static BOOL
+GetTouchDeviceInterfacePath(
+    _Out_ std::wstring& DevicePath
+    )
+{
     HDEVINFO deviceInfoSet;
     SP_DEVICE_INTERFACE_DATA interfaceData;
     DWORD requiredLength;
@@ -483,7 +493,31 @@ EnsureTouchDeviceOpen()
         nullptr);
     if (gAppState.TouchDevice == INVALID_HANDLE_VALUE)
     {
-        SetStatusText(L"Open touch driver failed: %ls", FormatWin32Error(GetLastError()).c_str());
+        DWORD openError = GetLastError();
+
+        if (openError == ERROR_FILE_NOT_FOUND || openError == ERROR_PATH_NOT_FOUND)
+        {
+            if (GetTouchDeviceInterfacePath(devicePath))
+            {
+                gAppState.TouchDevice = CreateFileW(
+                    devicePath.c_str(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    nullptr);
+                if (gAppState.TouchDevice != INVALID_HANDLE_VALUE)
+                {
+                    return TRUE;
+                }
+
+                openError = GetLastError();
+            }
+        }
+
+        SetStatusText(L"Open touch driver failed: %ls", FormatWin32Error(openError).c_str());
+        SetLastError(openError);
         return FALSE;
     }
 
