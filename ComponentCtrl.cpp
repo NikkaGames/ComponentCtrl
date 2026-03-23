@@ -2,6 +2,7 @@
 #include "ComponentCtrl.h"
 
 #include <initguid.h>
+#include <hidsdi.h>
 #include <setupapi.h>
 #include <strsafe.h>
 #include <winioctl.h>
@@ -12,11 +13,21 @@
 #include <windowsx.h>
 
 #include "../aw22xxx_led/Public.h"
+#include "../TouchScreen/inc/common.h"
 
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "hid.lib")
 
 #define MAX_LOADSTRING 100
 #define CONFIG_TABLE_BUFFER_SIZE (64u * 1024u)
+#define GOODIX_TOUCH_VID 0xDEED
+#define GOODIX_TOUCH_PID 0xFEED
+#define GOODIX_TOUCH_HARDWARE_ID L"ACPI\\GTX09916"
+#define GOODIX_REPORT_RATE_120HZ 0
+#define GOODIX_REPORT_RATE_240HZ 1
+#define GOODIX_REPORT_RATE_360HZ 2
+#define GOODIX_REPORT_RATE_480HZ 3
+#define GOODIX_REPORT_RATE_960HZ 4
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -24,6 +35,7 @@ WCHAR szWindowClass[MAX_LOADSTRING];
 
 struct APP_STATE {
     HANDLE Device;
+    HANDLE TouchDevice;
     HWND MainWindow;
     HWND ConfigCombo;
     HWND ApplyButton;
@@ -31,11 +43,14 @@ struct APP_STATE {
     HWND OffButton;
     HWND RgbCheck;
     HWND InfoText;
+    HWND TouchRateCombo;
+    HWND TouchApplyButton;
+    HWND TouchInfoText;
     HWND StatusText;
     std::vector<AW22XXX_CONFIG_DESCRIPTOR> Configs;
 };
 
-static APP_STATE gAppState = { INVALID_HANDLE_VALUE };
+static APP_STATE gAppState = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
 
 ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
@@ -112,6 +127,26 @@ FormatConfigDisplayName(
     return std::wstring(buffer);
 }
 
+static PCWSTR
+TouchReportRateLabel(
+    _In_ ULONG ReportRateLevel
+    )
+{
+    switch (ReportRateLevel)
+    {
+    case GOODIX_REPORT_RATE_120HZ:
+        return L"120 Hz";
+    case GOODIX_REPORT_RATE_240HZ:
+        return L"240 Hz";
+    case GOODIX_REPORT_RATE_480HZ:
+        return L"480 Hz";
+    case GOODIX_REPORT_RATE_960HZ:
+        return L"960 Hz";
+    default:
+        return L"Unknown";
+    }
+}
+
 static void
 SetStatusText(
     _In_z_ _Printf_format_string_ PCWSTR Format,
@@ -155,7 +190,8 @@ SetInfoText(
 static void
 EnableInteractiveControls(
     _In_ BOOL EnableApply,
-    _In_ BOOL EnableDeviceActions
+    _In_ BOOL EnableDeviceActions,
+    _In_ BOOL EnableTouchControls
     )
 {
     if (gAppState.ConfigCombo != nullptr)
@@ -177,6 +213,14 @@ EnableInteractiveControls(
     if (gAppState.RgbCheck != nullptr)
     {
         EnableWindow(gAppState.RgbCheck, EnableDeviceActions);
+    }
+    if (gAppState.TouchRateCombo != nullptr)
+    {
+        EnableWindow(gAppState.TouchRateCombo, EnableTouchControls);
+    }
+    if (gAppState.TouchApplyButton != nullptr)
+    {
+        EnableWindow(gAppState.TouchApplyButton, EnableTouchControls);
     }
 }
 
@@ -261,6 +305,16 @@ CloseDeviceHandle()
     }
 }
 
+static void
+CloseTouchDeviceHandle()
+{
+    if (gAppState.TouchDevice != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(gAppState.TouchDevice);
+        gAppState.TouchDevice = INVALID_HANDLE_VALUE;
+    }
+}
+
 static BOOL
 EnsureDeviceOpen()
 {
@@ -288,6 +342,348 @@ EnsureDeviceOpen()
     if (gAppState.Device == INVALID_HANDLE_VALUE)
     {
         SetStatusText(L"Open driver failed: %ls", FormatWin32Error(GetLastError()).c_str());
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOL
+MultiSzContainsString(
+    _In_reads_bytes_(BufferLength) const BYTE* Buffer,
+    _In_ DWORD BufferLength,
+    _In_z_ PCWSTR Needle
+    )
+{
+    const WCHAR* current;
+    size_t remainingChars;
+
+    if ((Buffer == nullptr) || (BufferLength < sizeof(WCHAR)) || (Needle == nullptr))
+    {
+        return FALSE;
+    }
+
+    current = reinterpret_cast<const WCHAR*>(Buffer);
+    remainingChars = BufferLength / sizeof(WCHAR);
+
+    while ((remainingChars > 1) && (*current != L'\0'))
+    {
+        if (_wcsicmp(current, Needle) == 0)
+        {
+            return TRUE;
+        }
+
+        size_t currentLength = wcslen(current);
+        if (currentLength + 1 > remainingChars)
+        {
+            break;
+        }
+
+        current += currentLength + 1;
+        remainingChars -= currentLength + 1;
+    }
+
+    return FALSE;
+}
+
+static BOOL
+ReadTouchReportRateLevel(
+    _Out_ ULONG* ReportRateLevel
+    )
+{
+    HDEVINFO deviceInfoSet;
+    SP_DEVINFO_DATA deviceInfoData;
+    DWORD index;
+    BOOL found;
+
+    *ReportRateLevel = GOODIX_REPORT_RATE_240HZ;
+
+    deviceInfoSet = SetupDiGetClassDevsW(
+        nullptr,
+        nullptr,
+        nullptr,
+        DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (deviceInfoSet == INVALID_HANDLE_VALUE)
+    {
+        return FALSE;
+    }
+
+    found = FALSE;
+    deviceInfoData.cbSize = sizeof(deviceInfoData);
+    for (index = 0; SetupDiEnumDeviceInfo(deviceInfoSet, index, &deviceInfoData); index++)
+    {
+        DWORD requiredLength = 0;
+        DWORD propertyType = 0;
+
+        (void)SetupDiGetDeviceRegistryPropertyW(
+            deviceInfoSet,
+            &deviceInfoData,
+            SPDRP_HARDWAREID,
+            &propertyType,
+            nullptr,
+            0,
+            &requiredLength);
+
+        if ((requiredLength == 0) || (propertyType != REG_MULTI_SZ))
+        {
+            continue;
+        }
+
+        std::vector<BYTE> hardwareIds(requiredLength);
+        if (!SetupDiGetDeviceRegistryPropertyW(
+                deviceInfoSet,
+                &deviceInfoData,
+                SPDRP_HARDWAREID,
+                &propertyType,
+                hardwareIds.data(),
+                requiredLength,
+                nullptr))
+        {
+            continue;
+        }
+
+        if (!MultiSzContainsString(hardwareIds.data(), requiredLength, GOODIX_TOUCH_HARDWARE_ID))
+        {
+            continue;
+        }
+
+        HKEY deviceKey = SetupDiOpenDevRegKey(
+            deviceInfoSet,
+            &deviceInfoData,
+            DICS_FLAG_GLOBAL,
+            0,
+            DIREG_DEV,
+            KEY_READ);
+        if (deviceKey != INVALID_HANDLE_VALUE)
+        {
+            DWORD valueType = 0;
+            DWORD value = GOODIX_REPORT_RATE_240HZ;
+            DWORD valueSize = sizeof(value);
+
+            if ((RegQueryValueExW(
+                    deviceKey,
+                    L"ReportRateLevel",
+                    nullptr,
+                    &valueType,
+                    reinterpret_cast<LPBYTE>(&value),
+                    &valueSize) == ERROR_SUCCESS)
+                && (valueType == REG_DWORD)
+                && (valueSize == sizeof(value)))
+            {
+                *ReportRateLevel = value;
+            }
+
+            RegCloseKey(deviceKey);
+        }
+
+        found = TRUE;
+        break;
+    }
+
+    SetupDiDestroyDeviceInfoList(deviceInfoSet);
+    if (!found)
+    {
+        SetLastError(ERROR_NOT_FOUND);
+    }
+
+    return found;
+}
+
+static BOOL
+GetTouchDevicePath(
+    _Out_ std::wstring& DevicePath
+    )
+{
+    GUID hidGuid;
+    HDEVINFO deviceInfoSet;
+    SP_DEVICE_INTERFACE_DATA interfaceData;
+    DWORD index;
+    BOOL found;
+
+    DevicePath.clear();
+    HidD_GetHidGuid(&hidGuid);
+    deviceInfoSet = SetupDiGetClassDevsW(
+        &hidGuid,
+        nullptr,
+        nullptr,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (deviceInfoSet == INVALID_HANDLE_VALUE)
+    {
+        return FALSE;
+    }
+
+    found = FALSE;
+    interfaceData.cbSize = sizeof(interfaceData);
+    for (index = 0; SetupDiEnumDeviceInterfaces(deviceInfoSet, nullptr, &hidGuid, index, &interfaceData); index++)
+    {
+        DWORD requiredLength = 0;
+        std::vector<BYTE> detailBuffer;
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_W detailData;
+        HANDLE deviceHandle;
+        HIDD_ATTRIBUTES attributes;
+
+        (void)SetupDiGetDeviceInterfaceDetailW(
+            deviceInfoSet,
+            &interfaceData,
+            nullptr,
+            0,
+            &requiredLength,
+            nullptr);
+        if (requiredLength < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W))
+        {
+            continue;
+        }
+
+        detailBuffer.resize(requiredLength);
+        detailData = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(detailBuffer.data());
+        detailData->cbSize = sizeof(*detailData);
+
+        if (!SetupDiGetDeviceInterfaceDetailW(
+                deviceInfoSet,
+                &interfaceData,
+                detailData,
+                requiredLength,
+                nullptr,
+                nullptr))
+        {
+            continue;
+        }
+
+        deviceHandle = CreateFileW(
+            detailData->DevicePath,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (deviceHandle == INVALID_HANDLE_VALUE)
+        {
+            continue;
+        }
+
+        attributes.Size = sizeof(attributes);
+        if (HidD_GetAttributes(deviceHandle, &attributes)
+            && (attributes.VendorID == GOODIX_TOUCH_VID)
+            && (attributes.ProductID == GOODIX_TOUCH_PID))
+        {
+            DevicePath.assign(detailData->DevicePath);
+            found = TRUE;
+            CloseHandle(deviceHandle);
+            break;
+        }
+
+        CloseHandle(deviceHandle);
+    }
+
+    SetupDiDestroyDeviceInfoList(deviceInfoSet);
+    if (!found)
+    {
+        SetLastError(ERROR_NOT_FOUND);
+    }
+
+    return found;
+}
+
+static BOOL
+EnsureTouchDeviceOpen()
+{
+    std::wstring devicePath;
+
+    if (gAppState.TouchDevice != INVALID_HANDLE_VALUE)
+    {
+        return TRUE;
+    }
+
+    if (!GetTouchDevicePath(devicePath))
+    {
+        SetStatusText(L"Touch driver interface not found: %ls", FormatWin32Error(GetLastError()).c_str());
+        return FALSE;
+    }
+
+    gAppState.TouchDevice = CreateFileW(
+        devicePath.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (gAppState.TouchDevice == INVALID_HANDLE_VALUE)
+    {
+        SetStatusText(L"Open touch driver failed: %ls", FormatWin32Error(GetLastError()).c_str());
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static INT
+PopulateTouchRateCombo(
+    _In_ ULONG SelectedLevel
+    )
+{
+    struct TOUCH_RATE_OPTION {
+        ULONG Level;
+        PCWSTR Label;
+    };
+    static const TOUCH_RATE_OPTION kOptions[] = {
+        { GOODIX_REPORT_RATE_120HZ, L"120 Hz" },
+        { GOODIX_REPORT_RATE_240HZ, L"240 Hz" },
+        { GOODIX_REPORT_RATE_480HZ, L"480 Hz" },
+        { GOODIX_REPORT_RATE_960HZ, L"960 Hz" },
+    };
+    INT selectedIndex = -1;
+
+    SendMessageW(gAppState.TouchRateCombo, CB_RESETCONTENT, 0, 0);
+    for (INT i = 0; i < ARRAYSIZE(kOptions); i++)
+    {
+        INT comboIndex = (INT)SendMessageW(gAppState.TouchRateCombo, CB_ADDSTRING, 0, (LPARAM)kOptions[i].Label);
+        if (comboIndex < 0)
+        {
+            continue;
+        }
+
+        SendMessageW(gAppState.TouchRateCombo, CB_SETITEMDATA, (WPARAM)comboIndex, (LPARAM)kOptions[i].Level);
+        if (kOptions[i].Level == SelectedLevel)
+        {
+            selectedIndex = comboIndex;
+        }
+    }
+
+    if ((selectedIndex < 0) && (SendMessageW(gAppState.TouchRateCombo, CB_GETCOUNT, 0, 0) > 0))
+    {
+        selectedIndex = 1;
+    }
+
+    if (selectedIndex >= 0)
+    {
+        SendMessageW(gAppState.TouchRateCombo, CB_SETCURSEL, (WPARAM)selectedIndex, 0);
+    }
+
+    return selectedIndex;
+}
+
+static BOOL
+ApplyTouchReportRate(
+    _In_ ULONG ReportRateLevel
+    )
+{
+    HIDMINI_CONTROL_INFO controlInfo;
+
+    if (!EnsureTouchDeviceOpen())
+    {
+        return FALSE;
+    }
+
+    ZeroMemory(&controlInfo, sizeof(controlInfo));
+    controlInfo.ReportId = CONTROL_COLLECTION_REPORT_ID;
+    controlInfo.ControlCode = HIDMINI_CONTROL_CODE_SET_REPORT_RATE;
+    controlInfo.u.ReportRate.Level = ReportRateLevel;
+
+    if (!HidD_SetFeature(gAppState.TouchDevice, &controlInfo, sizeof(controlInfo)))
+    {
+        SetStatusText(L"Set touch report rate failed: %ls", FormatWin32Error(GetLastError()).c_str());
         return FALSE;
     }
 
@@ -458,48 +854,81 @@ RefreshUi()
 {
     AW22XXX_DEVICE_INFORMATION information;
     INT availableConfigCount;
+    ULONG touchReportRateLevel = GOODIX_REPORT_RATE_240HZ;
+    BOOL ledAvailable;
+    BOOL touchAvailable;
 
-    if (!FetchConfigTable(gAppState.Configs) || !FetchDeviceInformation(&information))
+    ledAvailable = FetchConfigTable(gAppState.Configs) && FetchDeviceInformation(&information);
+    touchAvailable = ReadTouchReportRateLevel(&touchReportRateLevel);
+
+    if (ledAvailable)
     {
-        EnableInteractiveControls(FALSE, FALSE);
-        SetInfoText(L"Driver not available or not responding.");
-        return;
-    }
+        availableConfigCount = PopulateConfigCombo(information.CurrentConfigId);
+        SendMessageW(
+            gAppState.RgbCheck,
+            BM_SETCHECK,
+            information.UseRgbOverride ? BST_CHECKED : BST_UNCHECKED,
+            0);
 
-    availableConfigCount = PopulateConfigCombo(information.CurrentConfigId);
-    SendMessageW(
-        gAppState.RgbCheck,
-        BM_SETCHECK,
-        information.UseRgbOverride ? BST_CHECKED : BST_UNCHECKED,
-        0);
-
-    SetInfoText(
-        L"Chip ID: 0x%02x\r\n"
-        L"Chip Type: %u\r\n"
-        L"Selected Config: 0x%02lx\r\n"
-        L"Available Configs: %lu / %zu\r\n"
-        L"IMAX: 0x%02x\r\n"
-        L"Tasks: 0x%02x / 0x%02x\r\n"
-        L"Flags: 0x%02x",
-        information.ChipIdRegister,
-        information.ChipType,
-        information.CurrentConfigId,
-        (ULONG)availableConfigCount,
-        gAppState.Configs.size(),
-        information.ImaxCode,
-        information.Task0,
-        information.Task1,
-        information.Flags);
-
-    if (availableConfigCount > 0)
-    {
-        SetStatusText(L"Ready");
-        EnableInteractiveControls(TRUE, TRUE);
+        SetInfoText(
+            L"Chip ID: 0x%02x\r\n"
+            L"Chip Type: %u\r\n"
+            L"Selected Config: 0x%02lx\r\n"
+            L"Available Configs: %lu / %zu\r\n"
+            L"IMAX: 0x%02x\r\n"
+            L"Tasks: 0x%02x / 0x%02x\r\n"
+            L"Flags: 0x%02x",
+            information.ChipIdRegister,
+            information.ChipType,
+            information.CurrentConfigId,
+            (ULONG)availableConfigCount,
+            gAppState.Configs.size(),
+            information.ImaxCode,
+            information.Task0,
+            information.Task1,
+            information.Flags);
     }
     else
     {
-        SetStatusText(L"Driver responded, but no available configs are present.");
-        EnableInteractiveControls(FALSE, TRUE);
+        availableConfigCount = 0;
+        SetInfoText(L"AW22 LED driver not available.");
+    }
+
+    if (touchAvailable)
+    {
+        std::wstring touchInfo;
+
+        PopulateTouchRateCombo(touchReportRateLevel);
+        touchInfo = std::wstring(L"Touchscreen report rate: ")
+            + TouchReportRateLabel(touchReportRateLevel)
+            + L"\r\nApplies immediately and persists across reboot.";
+        SetWindowTextW(gAppState.TouchInfoText, touchInfo.c_str());
+    }
+    else
+    {
+        PopulateTouchRateCombo(GOODIX_REPORT_RATE_240HZ);
+        SetWindowTextW(gAppState.TouchInfoText, L"Goodix GT9916R touchscreen driver not available.");
+    }
+
+    EnableInteractiveControls(
+        ledAvailable && (availableConfigCount > 0),
+        ledAvailable,
+        touchAvailable);
+
+    if (ledAvailable || touchAvailable)
+    {
+        if (ledAvailable && (availableConfigCount == 0))
+        {
+            SetStatusText(L"Touchscreen ready. LED driver responded without available configs.");
+        }
+        else
+        {
+            SetStatusText(L"Ready");
+        }
+    }
+    else
+    {
+        SetStatusText(L"No supported devices found.");
     }
 }
 
@@ -547,6 +976,35 @@ TurnLedsOff()
     }
 
     SetStatusText(L"LED output disabled.");
+    RefreshUi();
+}
+
+static void
+ApplySelectedTouchRate()
+{
+    LRESULT selectedIndex;
+    LRESULT reportRateLevel;
+
+    selectedIndex = SendMessageW(gAppState.TouchRateCombo, CB_GETCURSEL, 0, 0);
+    if (selectedIndex == CB_ERR)
+    {
+        SetStatusText(L"No touch report rate selected.");
+        return;
+    }
+
+    reportRateLevel = SendMessageW(gAppState.TouchRateCombo, CB_GETITEMDATA, (WPARAM)selectedIndex, 0);
+    if (reportRateLevel == CB_ERR)
+    {
+        SetStatusText(L"Selected touch report rate is invalid.");
+        return;
+    }
+
+    if (!ApplyTouchReportRate((ULONG)reportRateLevel))
+    {
+        return;
+    }
+
+    SetStatusText(L"Applied touch report rate %ls.", TouchReportRateLabel((ULONG)reportRateLevel));
     RefreshUi();
 }
 
@@ -647,9 +1105,65 @@ CreateMainControls(
         16,
         90,
         388,
-        124,
+        120,
         Window,
         (HMENU)IDC_INFO_TEXT,
+        hInst,
+        nullptr);
+
+    (void)CreateWindowExW(
+        0,
+        L"STATIC",
+        L"Touch rate:",
+        WS_CHILD | WS_VISIBLE,
+        16,
+        226,
+        92,
+        20,
+        Window,
+        nullptr,
+        hInst,
+        nullptr);
+
+    gAppState.TouchRateCombo = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        L"COMBOBOX",
+        nullptr,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST,
+        112,
+        222,
+        160,
+        200,
+        Window,
+        (HMENU)IDC_TOUCH_RATE_COMBO,
+        hInst,
+        nullptr);
+
+    gAppState.TouchApplyButton = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Set Rate",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        288,
+        222,
+        116,
+        28,
+        Window,
+        (HMENU)IDC_TOUCH_APPLY_BUTTON,
+        hInst,
+        nullptr);
+
+    gAppState.TouchInfoText = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        L"STATIC",
+        L"",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        16,
+        262,
+        504,
+        48,
+        Window,
+        (HMENU)IDC_TOUCH_INFO_TEXT,
         hInst,
         nullptr);
 
@@ -659,7 +1173,7 @@ CreateMainControls(
         L"Connecting...",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         16,
-        226,
+        322,
         504,
         20,
         Window,
@@ -742,7 +1256,7 @@ InitInstance(
         CW_USEDEFAULT,
         0,
         552,
-        300,
+        390,
         nullptr,
         nullptr,
         hInstance,
@@ -772,7 +1286,7 @@ WndProc(
     {
     case WM_CREATE:
         CreateMainControls(hWnd);
-        EnableInteractiveControls(FALSE, FALSE);
+        EnableInteractiveControls(FALSE, FALSE, FALSE);
         RefreshUi();
         return 0;
 
@@ -785,11 +1299,16 @@ WndProc(
 
         case IDC_REFRESH_BUTTON:
             CloseDeviceHandle();
+            CloseTouchDeviceHandle();
             RefreshUi();
             return 0;
 
         case IDC_OFF_BUTTON:
             TurnLedsOff();
+            return 0;
+
+        case IDC_TOUCH_APPLY_BUTTON:
+            ApplySelectedTouchRate();
             return 0;
 
         case IDM_ABOUT:
@@ -804,6 +1323,7 @@ WndProc(
 
     case WM_DESTROY:
         CloseDeviceHandle();
+        CloseTouchDeviceHandle();
         PostQuitMessage(0);
         return 0;
     }
