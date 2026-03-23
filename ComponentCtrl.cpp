@@ -1256,7 +1256,7 @@ InitInstance(
         CW_USEDEFAULT,
         0,
         552,
-        390,
+        420,
         nullptr,
         nullptr,
         hInstance,
