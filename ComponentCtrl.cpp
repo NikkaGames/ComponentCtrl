@@ -2,6 +2,7 @@
 #include "ComponentCtrl.h"
 
 #include <initguid.h>
+#include <cfgmgr32.h>
 #include <hidsdi.h>
 #include <setupapi.h>
 #include <strsafe.h>
@@ -16,6 +17,7 @@
 #include "../TouchScreen/inc/common.h"
 
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "hid.lib")
 
 #define MAX_LOADSTRING 100
@@ -387,6 +389,63 @@ MultiSzContainsString(
 }
 
 static BOOL
+TouchDeviceInstanceMatches(
+    _In_ DEVINST DeviceInstance
+    )
+{
+    DEVINST currentDevice = DeviceInstance;
+
+    for (;;)
+    {
+        WCHAR instanceId[MAX_DEVICE_ID_LEN];
+        ULONG requiredLength;
+        CONFIGRET configStatus;
+
+        if (CM_Get_Device_IDW(currentDevice, instanceId, ARRAYSIZE(instanceId), 0) == CR_SUCCESS)
+        {
+            if (wcsstr(instanceId, GOODIX_TOUCH_HARDWARE_ID) != nullptr)
+            {
+                return TRUE;
+            }
+        }
+
+        requiredLength = 0;
+        configStatus = CM_Get_DevNode_Registry_PropertyW(
+            currentDevice,
+            CM_DRP_HARDWAREID,
+            nullptr,
+            nullptr,
+            &requiredLength,
+            0);
+        if ((configStatus == CR_BUFFER_SMALL) && (requiredLength >= sizeof(WCHAR)))
+        {
+            std::vector<BYTE> hardwareIds(requiredLength);
+            if (CM_Get_DevNode_Registry_PropertyW(
+                    currentDevice,
+                    CM_DRP_HARDWAREID,
+                    nullptr,
+                    hardwareIds.data(),
+                    &requiredLength,
+                    0) == CR_SUCCESS)
+            {
+                if (MultiSzContainsString(hardwareIds.data(), requiredLength, GOODIX_TOUCH_HARDWARE_ID))
+                {
+                    return TRUE;
+                }
+            }
+        }
+
+        configStatus = CM_Get_Parent(&currentDevice, currentDevice, 0);
+        if (configStatus != CR_SUCCESS)
+        {
+            break;
+        }
+    }
+
+    return FALSE;
+}
+
+static BOOL
 ReadTouchReportRateLevel(
     _Out_ ULONG* ReportRateLevel
     )
@@ -497,6 +556,7 @@ GetTouchDevicePath(
     GUID hidGuid;
     HDEVINFO deviceInfoSet;
     SP_DEVICE_INTERFACE_DATA interfaceData;
+    SP_DEVINFO_DATA deviceInfoData;
     DWORD index;
     BOOL found;
 
@@ -514,13 +574,12 @@ GetTouchDevicePath(
 
     found = FALSE;
     interfaceData.cbSize = sizeof(interfaceData);
+    deviceInfoData.cbSize = sizeof(deviceInfoData);
     for (index = 0; SetupDiEnumDeviceInterfaces(deviceInfoSet, nullptr, &hidGuid, index, &interfaceData); index++)
     {
         DWORD requiredLength = 0;
         std::vector<BYTE> detailBuffer;
         PSP_DEVICE_INTERFACE_DETAIL_DATA_W detailData;
-        HANDLE deviceHandle;
-        HIDD_ATTRIBUTES attributes;
 
         (void)SetupDiGetDeviceInterfaceDetailW(
             deviceInfoSet,
@@ -528,7 +587,7 @@ GetTouchDevicePath(
             nullptr,
             0,
             &requiredLength,
-            nullptr);
+            &deviceInfoData);
         if (requiredLength < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W))
         {
             continue;
@@ -544,36 +603,19 @@ GetTouchDevicePath(
                 detailData,
                 requiredLength,
                 nullptr,
-                nullptr))
+                &deviceInfoData))
         {
             continue;
         }
 
-        deviceHandle = CreateFileW(
-            detailData->DevicePath,
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-        if (deviceHandle == INVALID_HANDLE_VALUE)
+        if (!TouchDeviceInstanceMatches(deviceInfoData.DevInst))
         {
             continue;
         }
 
-        attributes.Size = sizeof(attributes);
-        if (HidD_GetAttributes(deviceHandle, &attributes)
-            && (attributes.VendorID == GOODIX_TOUCH_VID)
-            && (attributes.ProductID == GOODIX_TOUCH_PID))
-        {
-            DevicePath.assign(detailData->DevicePath);
-            found = TRUE;
-            CloseHandle(deviceHandle);
-            break;
-        }
-
-        CloseHandle(deviceHandle);
+        DevicePath.assign(detailData->DevicePath);
+        found = TRUE;
+        break;
     }
 
     SetupDiDestroyDeviceInfoList(deviceInfoSet);
