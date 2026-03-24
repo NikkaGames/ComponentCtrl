@@ -25,6 +25,7 @@
 #define GOODIX_REPORT_RATE_360HZ 2
 #define GOODIX_REPORT_RATE_480HZ 3
 #define GOODIX_REPORT_RATE_960HZ 4
+#define AW22XXX_CONFIG_ID_M_LED_OFF 0u
 #define UI_INITIAL_CLIENT_WIDTH 920
 #define UI_INITIAL_CLIENT_HEIGHT 700
 #define UI_MIN_CLIENT_WIDTH 760
@@ -39,6 +40,8 @@
 #define UI_LED_ACTION_WIDTH 188
 #define UI_TOUCH_ACTION_WIDTH 144
 #define UI_CONTROL_HEIGHT 32
+#define ID_ABOUT_AUTHOR_TEXT  50001
+#define ID_ABOUT_LINK_TEXT    50002
 
 static const COLORREF kColorWindowBackground = RGB(242, 245, 248);
 static const COLORREF kColorCardBackground = RGB(255, 255, 255);
@@ -277,37 +280,37 @@ ComputeUiLayout(
 
     Layout->ConfigComboRect = MakeRect(
         ledInnerLeft,
-        Layout->LedCardRect.top + 62,
+        Layout->LedCardRect.top + 72,
         ledMainRight,
-        Layout->LedCardRect.top + 62 + UI_CONTROL_HEIGHT);
+        Layout->LedCardRect.top + 72 + UI_CONTROL_HEIGHT);
     Layout->RgbCheckRect = MakeRect(
         ledInnerLeft,
-        Layout->LedCardRect.top + 102,
+        Layout->LedCardRect.top + 112,
         ledMainRight,
-        Layout->LedCardRect.top + 126);
+        Layout->LedCardRect.top + 136);
     Layout->ApplyButtonRect = MakeRect(
         ledActionLeft,
-        Layout->LedCardRect.top + 60,
+        Layout->LedCardRect.top + 70,
         ledInnerRight,
-        Layout->LedCardRect.top + 60 + UI_CONTROL_HEIGHT);
+        Layout->LedCardRect.top + 70 + UI_CONTROL_HEIGHT);
     Layout->RefreshButtonRect = MakeRect(
         ledActionLeft,
-        Layout->LedCardRect.top + 100,
+        Layout->LedCardRect.top + 110,
         ledInnerRight,
-        Layout->LedCardRect.top + 100 + UI_CONTROL_HEIGHT);
+        Layout->LedCardRect.top + 110 + UI_CONTROL_HEIGHT);
     Layout->FanToggleButtonRect = MakeRect(
         ledActionLeft,
-        Layout->LedCardRect.top + 140,
+        Layout->LedCardRect.top + 150,
         ledInnerRight,
-        Layout->LedCardRect.top + 140 + UI_CONTROL_HEIGHT);
+        Layout->LedCardRect.top + 150 + UI_CONTROL_HEIGHT);
     Layout->OffButtonRect = MakeRect(
         ledActionLeft,
-        Layout->LedCardRect.top + 180,
+        Layout->LedCardRect.top + 190,
         ledInnerRight,
-        Layout->LedCardRect.top + 180 + UI_CONTROL_HEIGHT);
+        Layout->LedCardRect.top + 190 + UI_CONTROL_HEIGHT);
     Layout->InfoTextRect = MakeRect(
         ledInnerLeft,
-        Layout->LedCardRect.top + 140,
+        Layout->LedCardRect.top + 148,
         ledMainRight,
         Layout->LedCardRect.bottom - 22);
 
@@ -315,17 +318,17 @@ ComputeUiLayout(
     touchInnerRight = Layout->TouchCardRect.right - 22;
     Layout->TouchRateComboRect = MakeRect(
         touchInnerLeft,
-        Layout->TouchCardRect.top + 62,
+        Layout->TouchCardRect.top + 72,
         touchInnerLeft + 220,
-        Layout->TouchCardRect.top + 62 + UI_CONTROL_HEIGHT);
+        Layout->TouchCardRect.top + 72 + UI_CONTROL_HEIGHT);
     Layout->TouchApplyButtonRect = MakeRect(
         Layout->TouchRateComboRect.right + 18,
-        Layout->TouchCardRect.top + 62,
+        Layout->TouchCardRect.top + 72,
         Layout->TouchRateComboRect.right + 18 + UI_TOUCH_ACTION_WIDTH,
-        Layout->TouchCardRect.top + 62 + UI_CONTROL_HEIGHT);
+        Layout->TouchCardRect.top + 72 + UI_CONTROL_HEIGHT);
     Layout->TouchInfoTextRect = MakeRect(
         touchInnerLeft,
-        Layout->TouchCardRect.top + 118,
+        Layout->TouchCardRect.top + 126,
         touchInnerRight,
         Layout->TouchCardRect.bottom - 20);
 
@@ -588,40 +591,6 @@ FormatConfigDisplayName(
         name.c_str(),
         Config.ConfigId);
     return std::wstring(buffer);
-}
-
-static BOOL
-FindConfigIdByName(
-    _In_z_ PCSTR Name,
-    _Out_ PULONG ConfigId
-    )
-{
-    size_t index;
-
-    if ((Name == nullptr) || (ConfigId == nullptr))
-    {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-
-    for (index = 0; index < gAppState.Configs.size(); index++)
-    {
-        const AW22XXX_CONFIG_DESCRIPTOR& config = gAppState.Configs[index];
-
-        if ((config.Flags & AW22XXX_CONFIG_FLAG_AVAILABLE) == 0u)
-        {
-            continue;
-        }
-
-        if (lstrcmpiA(config.Name, Name) == 0)
-        {
-            *ConfigId = config.ConfigId;
-            return TRUE;
-        }
-    }
-
-    SetLastError(ERROR_NOT_FOUND);
-    return FALSE;
 }
 
 static PCWSTR
@@ -1501,15 +1470,7 @@ ApplySelectedConfig()
 static void
 TurnLedsOff()
 {
-    ULONG ledOffConfigId;
-
-    if (!FindConfigIdByName("m_led_off.bin", &ledOffConfigId))
-    {
-        SetStatusText(L"LED-off config not found: %ls", FormatWin32Error(GetLastError()).c_str());
-        return;
-    }
-
-    if (!ApplyAw22ConfigById(ledOffConfigId, FALSE))
+    if (!ApplyAw22ConfigById(AW22XXX_CONFIG_ID_M_LED_OFF, FALSE))
     {
         return;
     }
@@ -2044,7 +2005,86 @@ About(
     switch (message)
     {
     case WM_INITDIALOG:
+    {
+        RECT dialogUnits;
+        RECT pixelRect;
+        HWND okButton;
+        HWND authorText;
+        HWND linkText;
+        HFONT dialogFont;
+
+        dialogUnits = MakeRect(0, 0, 250, 92);
+        pixelRect = dialogUnits;
+        MapDialogRect(hDlg, &pixelRect);
+        SetWindowPos(
+            hDlg,
+            nullptr,
+            0,
+            0,
+            pixelRect.right,
+            pixelRect.bottom,
+            SWP_NOMOVE | SWP_NOZORDER);
+
+        okButton = GetDlgItem(hDlg, IDOK);
+        if (okButton != nullptr)
+        {
+            RECT okUnits = MakeRect(178, 69, 228, 83);
+
+            MapDialogRect(hDlg, &okUnits);
+            SetWindowPos(
+                okButton,
+                nullptr,
+                okUnits.left,
+                okUnits.top,
+                okUnits.right - okUnits.left,
+                okUnits.bottom - okUnits.top,
+                SWP_NOZORDER);
+        }
+
+        dialogFont = (HFONT)SendMessageW(hDlg, WM_GETFONT, 0, 0);
+
+        pixelRect = MakeRect(42, 38, 210, 48);
+        MapDialogRect(hDlg, &pixelRect);
+        authorText = CreateWindowExW(
+            0,
+            L"STATIC",
+            L"Nikka Okromtchedlishvili",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            pixelRect.left,
+            pixelRect.top,
+            pixelRect.right - pixelRect.left,
+            pixelRect.bottom - pixelRect.top,
+            hDlg,
+            (HMENU)ID_ABOUT_AUTHOR_TEXT,
+            hInst,
+            nullptr);
+        if ((authorText != nullptr) && (dialogFont != nullptr))
+        {
+            SendMessageW(authorText, WM_SETFONT, (WPARAM)dialogFont, TRUE);
+        }
+
+        pixelRect = MakeRect(42, 50, 210, 60);
+        MapDialogRect(hDlg, &pixelRect);
+        linkText = CreateWindowExW(
+            0,
+            L"STATIC",
+            L"https://t.me/RedMagicWoA",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            pixelRect.left,
+            pixelRect.top,
+            pixelRect.right - pixelRect.left,
+            pixelRect.bottom - pixelRect.top,
+            hDlg,
+            (HMENU)ID_ABOUT_LINK_TEXT,
+            hInst,
+            nullptr);
+        if ((linkText != nullptr) && (dialogFont != nullptr))
+        {
+            SendMessageW(linkText, WM_SETFONT, (WPARAM)dialogFont, TRUE);
+        }
+
         return (INT_PTR)TRUE;
+    }
 
     case WM_COMMAND:
         if ((LOWORD(wParam) == IDOK) || (LOWORD(wParam) == IDCANCEL))
