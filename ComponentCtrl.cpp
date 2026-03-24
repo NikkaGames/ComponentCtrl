@@ -782,7 +782,8 @@ OpenPickerPopup(
     )
 {
     RECT ownerRect;
-    RECT clientRect;
+    HMONITOR monitor;
+    MONITORINFO monitorInfo;
     INT visibleCount;
     INT popupWidth;
     INT popupHeight;
@@ -821,25 +822,30 @@ OpenPickerPopup(
     visibleCount = min((INT)gPickerState.Items.size(), PICKER_MAX_VISIBLE_ITEMS);
     popupHeight = (visibleCount * PICKER_ITEM_HEIGHT) + 2;
     GetWindowRect(OwnerControl, &ownerRect);
-    MapWindowPoints(nullptr, gAppState.MainWindow, (LPPOINT)&ownerRect, 2);
-    GetClientRect(gAppState.MainWindow, &clientRect);
+    monitor = MonitorFromRect(&ownerRect, MONITOR_DEFAULTTONEAREST);
+    ZeroMemory(&monitorInfo, sizeof(monitorInfo));
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (!GetMonitorInfoW(monitor, &monitorInfo))
+    {
+        monitorInfo.rcWork = ownerRect;
+    }
 
     popupWidth = max(ownerRect.right - ownerRect.left, 320);
     popupX = ownerRect.left;
     popupY = ownerRect.bottom + 4;
-    if ((popupX + popupWidth) > (clientRect.right - UI_MARGIN))
+    if ((popupX + popupWidth) > (monitorInfo.rcWork.right - UI_MARGIN))
     {
-        popupX = max(UI_MARGIN, clientRect.right - popupWidth - UI_MARGIN);
+        popupX = max(monitorInfo.rcWork.left + UI_MARGIN, monitorInfo.rcWork.right - popupWidth - UI_MARGIN);
     }
-    if ((popupY + popupHeight) > (clientRect.bottom - UI_MARGIN))
+    if ((popupY + popupHeight) > (monitorInfo.rcWork.bottom - UI_MARGIN))
     {
-        if ((ownerRect.top - 4 - popupHeight) >= UI_MARGIN)
+        if ((ownerRect.top - 4 - popupHeight) >= (monitorInfo.rcWork.top + UI_MARGIN))
         {
             popupY = ownerRect.top - 4 - popupHeight;
         }
         else
         {
-            popupHeight = max((PICKER_ITEM_HEIGHT * 3) + 2, clientRect.bottom - popupY - UI_MARGIN);
+            popupHeight = max((PICKER_ITEM_HEIGHT * 3) + 2, monitorInfo.rcWork.bottom - popupY - UI_MARGIN);
         }
     }
 
@@ -849,10 +855,10 @@ OpenPickerPopup(
         max((INT)gPickerState.Items.size() - visibleCount, 0));
 
     gPickerState.Window = CreateWindowExW(
-        0,
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         PICKER_POPUP_CLASS_NAME,
         nullptr,
-        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL,
+        WS_POPUP | WS_BORDER | WS_VSCROLL,
         popupX,
         popupY,
         popupWidth,
@@ -871,6 +877,7 @@ OpenPickerPopup(
 
     RegisterTouchWindow(gPickerState.Window, 0);
     SetWindowPos(gPickerState.Window, HWND_TOP, popupX, popupY, popupWidth, popupHeight, SWP_SHOWWINDOW);
+    SetFocus(gPickerState.Window);
     UpdatePickerScrollBar();
     InvalidateRect(gPickerState.Window, nullptr, TRUE);
 }
@@ -892,6 +899,9 @@ PickerPopupWndProc(
     {
         PAINTSTRUCT ps;
         HDC dc;
+        HDC memoryDc;
+        HBITMAP bitmap;
+        HBITMAP oldBitmap;
         RECT clientRect;
         INT visibleCount;
         INT index;
@@ -901,11 +911,17 @@ PickerPopupWndProc(
 
         dc = BeginPaint(Window, &ps);
         GetClientRect(Window, &clientRect);
-        FillRect(dc, &clientRect, gAppState.CardBrush);
+        memoryDc = CreateCompatibleDC(dc);
+        bitmap = CreateCompatibleBitmap(
+            dc,
+            max(clientRect.right - clientRect.left, 1),
+            max(clientRect.bottom - clientRect.top, 1));
+        oldBitmap = (HBITMAP)SelectObject(memoryDc, bitmap);
+        FillRect(memoryDc, &clientRect, gAppState.CardBrush);
 
-        oldFont = (HFONT)SelectObject(dc, gAppState.BodyFont);
-        oldBkMode = SetBkMode(dc, TRANSPARENT);
-        oldTextColor = SetTextColor(dc, kColorTextPrimary);
+        oldFont = (HFONT)SelectObject(memoryDc, gAppState.BodyFont);
+        oldBkMode = SetBkMode(memoryDc, TRANSPARENT);
+        oldTextColor = SetTextColor(memoryDc, kColorTextPrimary);
 
         visibleCount = GetPickerVisibleCount();
         for (index = 0; index < visibleCount; index++)
@@ -936,19 +952,40 @@ PickerPopupWndProc(
                 fillBrush = CreateSolidBrush(kColorCardBackground);
             }
 
-            FillRect(dc, &itemRect, fillBrush);
+            FillRect(memoryDc, &itemRect, fillBrush);
             DeleteObject(fillBrush);
             itemRect.left += 12;
             itemRect.right -= 12;
-            DrawTextW(dc, gPickerState.Items[(size_t)itemIndex].Label.c_str(), -1, &itemRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            DrawTextW(memoryDc, gPickerState.Items[(size_t)itemIndex].Label.c_str(), -1, &itemRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
 
-        SetTextColor(dc, oldTextColor);
-        SetBkMode(dc, oldBkMode);
-        SelectObject(dc, oldFont);
+        BitBlt(
+            dc,
+            0,
+            0,
+            clientRect.right - clientRect.left,
+            clientRect.bottom - clientRect.top,
+            memoryDc,
+            0,
+            0,
+            SRCCOPY);
+
+        SetTextColor(memoryDc, oldTextColor);
+        SetBkMode(memoryDc, oldBkMode);
+        SelectObject(memoryDc, oldFont);
+        SelectObject(memoryDc, oldBitmap);
+        DeleteObject(bitmap);
+        DeleteDC(memoryDc);
         EndPaint(Window, &ps);
         return 0;
     }
+
+    case WM_KILLFOCUS:
+        if ((HWND)WParam != gPickerState.OwnerControl)
+        {
+            ClosePickerPopup();
+        }
+        return 0;
 
     case WM_VSCROLL:
     {
