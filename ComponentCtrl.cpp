@@ -25,15 +25,20 @@
 #define GOODIX_REPORT_RATE_360HZ 2
 #define GOODIX_REPORT_RATE_480HZ 3
 #define GOODIX_REPORT_RATE_960HZ 4
-#define UI_WINDOW_WIDTH 760
-#define UI_WINDOW_HEIGHT 560
+#define UI_INITIAL_CLIENT_WIDTH 920
+#define UI_INITIAL_CLIENT_HEIGHT 700
+#define UI_MIN_CLIENT_WIDTH 760
+#define UI_MIN_CLIENT_HEIGHT 560
 #define UI_MARGIN 20
-#define UI_LED_CARD_TOP 74
-#define UI_LED_CARD_HEIGHT 244
-#define UI_TOUCH_CARD_TOP 336
-#define UI_TOUCH_CARD_HEIGHT 120
-#define UI_STATUS_CARD_TOP 474
-#define UI_STATUS_CARD_HEIGHT 60
+#define UI_LED_CARD_TOP 82
+#define UI_LED_CARD_HEIGHT 272
+#define UI_TOUCH_CARD_HEIGHT 152
+#define UI_STATUS_CARD_HEIGHT 104
+#define UI_CARD_GAP 18
+#define UI_SCROLL_STEP 48
+#define UI_LED_ACTION_WIDTH 188
+#define UI_TOUCH_ACTION_WIDTH 144
+#define UI_CONTROL_HEIGHT 32
 
 static const COLORREF kColorWindowBackground = RGB(242, 245, 248);
 static const COLORREF kColorCardBackground = RGB(255, 255, 255);
@@ -66,6 +71,9 @@ struct APP_STATE {
     HFONT SmallFont;
     HBRUSH WindowBrush;
     HBRUSH CardBrush;
+    int ScrollY;
+    int ClientWidth;
+    int ClientHeight;
     std::vector<AW22XXX_CONFIG_DESCRIPTOR> Configs;
 };
 
@@ -77,6 +85,25 @@ LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
 static BOOL         GetTouchDevicePath(_Out_ std::wstring& DevicePath);
 static BOOL         EnsureTouchDeviceOpen();
+
+typedef struct _UI_LAYOUT {
+    RECT HeaderTitleRect;
+    RECT HeaderSubtitleRect;
+    RECT LedCardRect;
+    RECT TouchCardRect;
+    RECT StatusCardRect;
+    RECT ConfigComboRect;
+    RECT ApplyButtonRect;
+    RECT RefreshButtonRect;
+    RECT OffButtonRect;
+    RECT RgbCheckRect;
+    RECT InfoTextRect;
+    RECT TouchRateComboRect;
+    RECT TouchApplyButtonRect;
+    RECT TouchInfoTextRect;
+    RECT StatusTextRect;
+    int ContentHeight;
+} UI_LAYOUT, *PUI_LAYOUT;
 
 static RECT
 MakeRect(
@@ -174,6 +201,233 @@ ApplyFont(
     }
 }
 
+static int
+ClampInt(
+    int Value,
+    int Minimum,
+    int Maximum
+    )
+{
+    if (Value < Minimum)
+    {
+        return Minimum;
+    }
+    if (Value > Maximum)
+    {
+        return Maximum;
+    }
+    return Value;
+}
+
+static void
+ComputeUiLayout(
+    _In_ int ClientWidth,
+    _In_ int ScrollY,
+    _Out_ PUI_LAYOUT Layout
+    )
+{
+    int cardLeft;
+    int cardRight;
+    int ledInnerLeft;
+    int ledInnerRight;
+    int ledActionLeft;
+    int ledMainRight;
+    int touchInnerLeft;
+    int touchInnerRight;
+
+    ZeroMemory(Layout, sizeof(*Layout));
+
+    int ledCardTop;
+    int touchCardTop;
+    int statusCardTop;
+
+    cardLeft = UI_MARGIN;
+    cardRight = max(ClientWidth - UI_MARGIN, cardLeft + 680);
+    ledCardTop = UI_LED_CARD_TOP;
+    touchCardTop = ledCardTop + UI_LED_CARD_HEIGHT + UI_CARD_GAP;
+    statusCardTop = touchCardTop + UI_TOUCH_CARD_HEIGHT + UI_CARD_GAP;
+
+    Layout->HeaderTitleRect = MakeRect(cardLeft, 18 - ScrollY, cardRight, 52 - ScrollY);
+    Layout->HeaderSubtitleRect = MakeRect(cardLeft, 48 - ScrollY, cardRight, 74 - ScrollY);
+
+    Layout->LedCardRect = MakeRect(
+        cardLeft,
+        ledCardTop - ScrollY,
+        cardRight,
+        ledCardTop + UI_LED_CARD_HEIGHT - ScrollY);
+    Layout->TouchCardRect = MakeRect(
+        cardLeft,
+        touchCardTop - ScrollY,
+        cardRight,
+        touchCardTop + UI_TOUCH_CARD_HEIGHT - ScrollY);
+    Layout->StatusCardRect = MakeRect(
+        cardLeft,
+        statusCardTop - ScrollY,
+        cardRight,
+        statusCardTop + UI_STATUS_CARD_HEIGHT - ScrollY);
+
+    ledInnerLeft = Layout->LedCardRect.left + 22;
+    ledInnerRight = Layout->LedCardRect.right - 22;
+    ledActionLeft = ledInnerRight - UI_LED_ACTION_WIDTH;
+    ledMainRight = ledActionLeft - 16;
+
+    Layout->ConfigComboRect = MakeRect(
+        ledInnerLeft,
+        Layout->LedCardRect.top + 62,
+        ledMainRight,
+        Layout->LedCardRect.top + 62 + UI_CONTROL_HEIGHT);
+    Layout->RgbCheckRect = MakeRect(
+        ledInnerLeft,
+        Layout->LedCardRect.top + 102,
+        ledMainRight,
+        Layout->LedCardRect.top + 126);
+    Layout->ApplyButtonRect = MakeRect(
+        ledActionLeft,
+        Layout->LedCardRect.top + 60,
+        ledInnerRight,
+        Layout->LedCardRect.top + 60 + UI_CONTROL_HEIGHT);
+    Layout->RefreshButtonRect = MakeRect(
+        ledActionLeft,
+        Layout->LedCardRect.top + 100,
+        ledInnerRight,
+        Layout->LedCardRect.top + 100 + UI_CONTROL_HEIGHT);
+    Layout->OffButtonRect = MakeRect(
+        ledActionLeft,
+        Layout->LedCardRect.top + 140,
+        ledInnerRight,
+        Layout->LedCardRect.top + 140 + UI_CONTROL_HEIGHT);
+    Layout->InfoTextRect = MakeRect(
+        ledInnerLeft,
+        Layout->LedCardRect.top + 144,
+        ledInnerRight,
+        Layout->LedCardRect.bottom - 20);
+
+    touchInnerLeft = Layout->TouchCardRect.left + 22;
+    touchInnerRight = Layout->TouchCardRect.right - 22;
+    Layout->TouchRateComboRect = MakeRect(
+        touchInnerLeft,
+        Layout->TouchCardRect.top + 62,
+        touchInnerLeft + 220,
+        Layout->TouchCardRect.top + 62 + UI_CONTROL_HEIGHT);
+    Layout->TouchApplyButtonRect = MakeRect(
+        Layout->TouchRateComboRect.right + 18,
+        Layout->TouchCardRect.top + 62,
+        Layout->TouchRateComboRect.right + 18 + UI_TOUCH_ACTION_WIDTH,
+        Layout->TouchCardRect.top + 62 + UI_CONTROL_HEIGHT);
+    Layout->TouchInfoTextRect = MakeRect(
+        touchInnerLeft,
+        Layout->TouchCardRect.top + 96,
+        touchInnerRight,
+        Layout->TouchCardRect.bottom - 18);
+
+    Layout->StatusTextRect = MakeRect(
+        Layout->StatusCardRect.left + 22,
+        Layout->StatusCardRect.top + 38,
+        Layout->StatusCardRect.right - 22,
+        Layout->StatusCardRect.bottom - 16);
+
+    Layout->ContentHeight = statusCardTop + UI_STATUS_CARD_HEIGHT + UI_MARGIN;
+}
+
+static void
+MoveChildControl(
+    _In_opt_ HWND Control,
+    _In_ const RECT& Rect
+    )
+{
+    if (Control != nullptr)
+    {
+        MoveWindow(
+            Control,
+            Rect.left,
+            Rect.top,
+            Rect.right - Rect.left,
+            Rect.bottom - Rect.top,
+            TRUE);
+    }
+}
+
+static void
+UpdateScrollBar(
+    _In_ HWND Window,
+    _In_ int ClientHeight,
+    _In_ int ContentHeight
+    )
+{
+    SCROLLINFO si;
+    int maxScroll;
+
+    maxScroll = max(ContentHeight - ClientHeight, 0);
+    gAppState.ScrollY = ClampInt(gAppState.ScrollY, 0, maxScroll);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = max(ContentHeight - 1, 0);
+    si.nPage = (UINT)max(ClientHeight, 0);
+    si.nPos = gAppState.ScrollY;
+    SetScrollInfo(Window, SB_VERT, &si, TRUE);
+    ShowScrollBar(Window, SB_VERT, maxScroll > 0);
+}
+
+static void
+ApplyLayout(
+    _In_ HWND Window,
+    _In_ BOOL RedrawWindowNow
+    )
+{
+    RECT clientRect;
+    UI_LAYOUT layout;
+
+    GetClientRect(Window, &clientRect);
+    gAppState.ClientWidth = clientRect.right - clientRect.left;
+    gAppState.ClientHeight = clientRect.bottom - clientRect.top;
+
+    ComputeUiLayout(gAppState.ClientWidth, 0, &layout);
+    UpdateScrollBar(Window, gAppState.ClientHeight, layout.ContentHeight);
+    ComputeUiLayout(gAppState.ClientWidth, gAppState.ScrollY, &layout);
+
+    MoveChildControl(gAppState.ConfigCombo, layout.ConfigComboRect);
+    MoveChildControl(gAppState.ApplyButton, layout.ApplyButtonRect);
+    MoveChildControl(gAppState.RefreshButton, layout.RefreshButtonRect);
+    MoveChildControl(gAppState.OffButton, layout.OffButtonRect);
+    MoveChildControl(gAppState.RgbCheck, layout.RgbCheckRect);
+    MoveChildControl(gAppState.InfoText, layout.InfoTextRect);
+    MoveChildControl(gAppState.TouchRateCombo, layout.TouchRateComboRect);
+    MoveChildControl(gAppState.TouchApplyButton, layout.TouchApplyButtonRect);
+    MoveChildControl(gAppState.TouchInfoText, layout.TouchInfoTextRect);
+    MoveChildControl(gAppState.StatusText, layout.StatusTextRect);
+
+    if (RedrawWindowNow)
+    {
+        RedrawWindow(Window, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    }
+}
+
+static void
+ScrollToPosition(
+    _In_ HWND Window,
+    _In_ int NewScrollY
+    )
+{
+    RECT clientRect;
+    UI_LAYOUT layout;
+    int maxScroll;
+
+    GetClientRect(Window, &clientRect);
+    ComputeUiLayout(clientRect.right - clientRect.left, 0, &layout);
+    maxScroll = max(layout.ContentHeight - (clientRect.bottom - clientRect.top), 0);
+    NewScrollY = ClampInt(NewScrollY, 0, maxScroll);
+    if (NewScrollY == gAppState.ScrollY)
+    {
+        return;
+    }
+
+    gAppState.ScrollY = NewScrollY;
+    ApplyLayout(Window, TRUE);
+}
+
 static void
 DrawRoundedCard(
     _In_ HDC Dc,
@@ -200,35 +454,30 @@ DrawUiChrome(
     )
 {
     RECT clientRect;
+    UI_LAYOUT layout;
     RECT headerRect;
-    RECT ledCardRect;
-    RECT touchCardRect;
-    RECT statusCardRect;
     HFONT oldFont;
     COLORREF oldTextColor;
     int oldBkMode;
 
     GetClientRect(Window, &clientRect);
     FillRect(Dc, &clientRect, gAppState.WindowBrush);
+    ComputeUiLayout(clientRect.right - clientRect.left, gAppState.ScrollY, &layout);
 
-    ledCardRect = MakeRect(UI_MARGIN, UI_LED_CARD_TOP, UI_WINDOW_WIDTH - UI_MARGIN, UI_LED_CARD_TOP + UI_LED_CARD_HEIGHT);
-    touchCardRect = MakeRect(UI_MARGIN, UI_TOUCH_CARD_TOP, UI_WINDOW_WIDTH - UI_MARGIN, UI_TOUCH_CARD_TOP + UI_TOUCH_CARD_HEIGHT);
-    statusCardRect = MakeRect(UI_MARGIN, UI_STATUS_CARD_TOP, UI_WINDOW_WIDTH - UI_MARGIN, UI_STATUS_CARD_TOP + UI_STATUS_CARD_HEIGHT);
-
-    DrawRoundedCard(Dc, ledCardRect);
-    DrawRoundedCard(Dc, touchCardRect);
-    DrawRoundedCard(Dc, statusCardRect);
+    DrawRoundedCard(Dc, layout.LedCardRect);
+    DrawRoundedCard(Dc, layout.TouchCardRect);
+    DrawRoundedCard(Dc, layout.StatusCardRect);
 
     oldBkMode = SetBkMode(Dc, TRANSPARENT);
     oldTextColor = SetTextColor(Dc, kColorTextPrimary);
 
-    headerRect = MakeRect(UI_MARGIN, 18, UI_WINDOW_WIDTH - UI_MARGIN, 52);
+    headerRect = layout.HeaderTitleRect;
     oldFont = (HFONT)SelectObject(Dc, gAppState.TitleFont);
     DrawTextW(Dc, L"Component Control", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     SelectObject(Dc, gAppState.SmallFont);
     SetTextColor(Dc, kColorTextMuted);
-    headerRect = MakeRect(UI_MARGIN, 48, UI_WINDOW_WIDTH - UI_MARGIN, 70);
+    headerRect = layout.HeaderSubtitleRect;
     DrawTextW(
         Dc,
         L"Manage AW22 fan lighting and GT9916R touchscreen settings from one place.",
@@ -238,18 +487,18 @@ DrawUiChrome(
 
     SelectObject(Dc, gAppState.SectionFont);
     SetTextColor(Dc, kColorTextAccent);
-    headerRect = MakeRect(ledCardRect.left + 18, ledCardRect.top + 14, ledCardRect.right - 18, ledCardRect.top + 38);
+    headerRect = MakeRect(layout.LedCardRect.left + 18, layout.LedCardRect.top + 14, layout.LedCardRect.right - 18, layout.LedCardRect.top + 38);
     DrawTextW(Dc, L"AW22 Lighting", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    headerRect = MakeRect(touchCardRect.left + 18, touchCardRect.top + 14, touchCardRect.right - 18, touchCardRect.top + 38);
+    headerRect = MakeRect(layout.TouchCardRect.left + 18, layout.TouchCardRect.top + 14, layout.TouchCardRect.right - 18, layout.TouchCardRect.top + 38);
     DrawTextW(Dc, L"GT9916R Touchscreen", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    headerRect = MakeRect(statusCardRect.left + 18, statusCardRect.top + 14, statusCardRect.right - 18, statusCardRect.top + 38);
+    headerRect = MakeRect(layout.StatusCardRect.left + 18, layout.StatusCardRect.top + 14, layout.StatusCardRect.right - 18, layout.StatusCardRect.top + 38);
     DrawTextW(Dc, L"Status", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     SelectObject(Dc, gAppState.SmallFont);
     SetTextColor(Dc, kColorTextMuted);
-    headerRect = MakeRect(ledCardRect.left + 24, ledCardRect.top + 48, ledCardRect.right - 24, ledCardRect.top + 66);
+    headerRect = MakeRect(layout.LedCardRect.left + 24, layout.LedCardRect.top + 48, layout.LedCardRect.right - 24, layout.LedCardRect.top + 66);
     DrawTextW(Dc, L"LED config", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    headerRect = MakeRect(touchCardRect.left + 24, touchCardRect.top + 48, touchCardRect.right - 24, touchCardRect.top + 66);
+    headerRect = MakeRect(layout.TouchCardRect.left + 24, layout.TouchCardRect.top + 48, layout.TouchCardRect.right - 24, layout.TouchCardRect.top + 66);
     DrawTextW(Dc, L"Sampling rate", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     SelectObject(Dc, oldFont);
@@ -345,6 +594,62 @@ TouchReportRateLabel(
     default:
         return L"Unknown";
     }
+}
+
+static PCWSTR
+Aw22ChipTypeLabel(
+    _In_ UCHAR ChipType
+    )
+{
+    switch (ChipType)
+    {
+    case AW22XXX_CHIPTYPE_22118:
+        return L"AW22118";
+    case AW22XXX_CHIPTYPE_22127:
+        return L"AW22127";
+    default:
+        return L"Unknown";
+    }
+}
+
+static std::wstring
+FormatAw22ChipStatus(
+    _In_ const AW22XXX_DEVICE_INFORMATION& Information
+    )
+{
+    WCHAR buffer[160];
+    PCWSTR baseState;
+    PCWSTR resetSuffix;
+
+    if (((Information.Flags & AW22XXX_DEVICE_FLAG_INITIALIZED) != 0u)
+        && ((Information.Flags & AW22XXX_DEVICE_FLAG_POWERED) != 0u))
+    {
+        baseState = L"Ready";
+    }
+    else if ((Information.Flags & AW22XXX_DEVICE_FLAG_POWERED) != 0u)
+    {
+        baseState = L"Powered";
+    }
+    else if ((Information.Flags & AW22XXX_DEVICE_FLAG_INITIALIZED) != 0u)
+    {
+        baseState = L"Initialized";
+    }
+    else
+    {
+        baseState = L"Unavailable";
+    }
+
+    resetSuffix = ((Information.Flags & AW22XXX_DEVICE_FLAG_SOFTRESET_VERIFIED) != 0u)
+        ? L", reset verified"
+        : L"";
+
+    (void)StringCchPrintfW(
+        buffer,
+        ARRAYSIZE(buffer),
+        L"%ls%ls",
+        baseState,
+        resetSuffix);
+    return std::wstring(buffer);
 }
 
 static void
@@ -981,23 +1286,28 @@ RefreshUi()
 
     if (ledAvailable)
     {
+        std::wstring chipStatus;
+
         availableConfigCount = PopulateConfigCombo(information.CurrentConfigId);
         SendMessageW(
             gAppState.RgbCheck,
             BM_SETCHECK,
             information.UseRgbOverride ? BST_CHECKED : BST_UNCHECKED,
             0);
+        chipStatus = FormatAw22ChipStatus(information);
 
         SetInfoText(
+            L"Chip Status: %ls\r\n"
             L"Chip ID: 0x%02x\r\n"
-            L"Chip Type: %u\r\n"
+            L"Chip Type: %ls\r\n"
             L"Selected Config: 0x%02lx\r\n"
             L"Available Configs: %lu / %zu\r\n"
             L"IMAX: 0x%02x\r\n"
             L"Tasks: 0x%02x / 0x%02x\r\n"
             L"Flags: 0x%02x",
+            chipStatus.c_str(),
             information.ChipIdRegister,
-            information.ChipType,
+            Aw22ChipTypeLabel(information.ChipType),
             information.CurrentConfigId,
             (ULONG)availableConfigCount,
             gAppState.Configs.size(),
@@ -1205,7 +1515,7 @@ CreateMainControls(
         0,
         L"STATIC",
         L"",
-        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_EDITCONTROL | SS_NOPREFIX,
         42,
         204,
         456,
@@ -1247,7 +1557,7 @@ CreateMainControls(
         0,
         L"STATIC",
         L"",
-        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_EDITCONTROL | SS_NOPREFIX,
         42,
         434,
         672,
@@ -1261,7 +1571,7 @@ CreateMainControls(
         0,
         L"STATIC",
         L"Connecting...",
-        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_EDITCONTROL | SS_NOPREFIX,
         42,
         506,
         672,
@@ -1280,7 +1590,7 @@ CreateMainControls(
     ApplyFont(gAppState.TouchRateCombo, gAppState.BodyFont);
     ApplyFont(gAppState.TouchApplyButton, gAppState.BodyFont);
     ApplyFont(gAppState.TouchInfoText, gAppState.SmallFont);
-    ApplyFont(gAppState.StatusText, gAppState.BodyFont);
+    ApplyFont(gAppState.StatusText, gAppState.SmallFont);
 }
 
 int APIENTRY
@@ -1355,8 +1665,8 @@ InitInstance(
     RECT windowRect;
 
     hInst = hInstance;
-    windowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    windowRect = MakeRect(0, 0, UI_WINDOW_WIDTH, UI_WINDOW_HEIGHT);
+    windowStyle = WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_CLIPCHILDREN;
+    windowRect = MakeRect(0, 0, UI_INITIAL_CLIENT_WIDTH, UI_INITIAL_CLIENT_HEIGHT);
     AdjustWindowRect(&windowRect, windowStyle, TRUE);
     hWnd = CreateWindowW(
         szWindowClass,
@@ -1389,16 +1699,91 @@ WndProc(
     LPARAM lParam
     )
 {
-    UNREFERENCED_PARAMETER(lParam);
-
     switch (message)
     {
     case WM_CREATE:
+        gAppState.ScrollY = 0;
         InitializeUiResources();
         CreateMainControls(hWnd);
         EnableInteractiveControls(FALSE, FALSE, FALSE);
+        ApplyLayout(hWnd, FALSE);
         RefreshUi();
+        ApplyLayout(hWnd, TRUE);
         return 0;
+
+    case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO* minMaxInfo = reinterpret_cast<MINMAXINFO*>(lParam);
+        RECT minTrackRect;
+        DWORD windowStyle;
+
+        windowStyle = (DWORD)GetWindowLongPtrW(hWnd, GWL_STYLE);
+        minTrackRect = MakeRect(0, 0, UI_MIN_CLIENT_WIDTH, UI_MIN_CLIENT_HEIGHT);
+        AdjustWindowRect(&minTrackRect, windowStyle, TRUE);
+        minMaxInfo->ptMinTrackSize.x = minTrackRect.right - minTrackRect.left;
+        minMaxInfo->ptMinTrackSize.y = minTrackRect.bottom - minTrackRect.top;
+        return 0;
+    }
+
+    case WM_SIZE:
+        ApplyLayout(hWnd, TRUE);
+        return 0;
+
+    case WM_VSCROLL:
+    {
+        SCROLLINFO si;
+        int newPos;
+
+        ZeroMemory(&si, sizeof(si));
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(hWnd, SB_VERT, &si);
+        newPos = si.nPos;
+
+        switch (LOWORD(wParam))
+        {
+        case SB_TOP:
+            newPos = si.nMin;
+            break;
+        case SB_BOTTOM:
+            newPos = si.nMax;
+            break;
+        case SB_LINEUP:
+            newPos -= UI_SCROLL_STEP;
+            break;
+        case SB_LINEDOWN:
+            newPos += UI_SCROLL_STEP;
+            break;
+        case SB_PAGEUP:
+            newPos -= max(gAppState.ClientHeight - UI_SCROLL_STEP, UI_SCROLL_STEP);
+            break;
+        case SB_PAGEDOWN:
+            newPos += max(gAppState.ClientHeight - UI_SCROLL_STEP, UI_SCROLL_STEP);
+            break;
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK:
+            newPos = si.nTrackPos;
+            break;
+        default:
+            return 0;
+        }
+
+        ScrollToPosition(hWnd, newPos);
+        return 0;
+    }
+
+    case WM_MOUSEWHEEL:
+    {
+        short wheelDelta;
+
+        wheelDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+        if (wheelDelta != 0)
+        {
+            ScrollToPosition(hWnd, gAppState.ScrollY - ((wheelDelta / WHEEL_DELTA) * UI_SCROLL_STEP));
+            return 0;
+        }
+        break;
+    }
 
     case WM_ERASEBKGND:
         return 1;
