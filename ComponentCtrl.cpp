@@ -1,6 +1,7 @@
 #include "framework.h"
 #include "ComponentCtrl.h"
 
+#include <commctrl.h>
 #include <initguid.h>
 #include <setupapi.h>
 #include <strsafe.h>
@@ -15,6 +16,8 @@
 #include "../TouchScreen/inc/common.h"
 
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define MAX_LOADSTRING 100
 #define CONFIG_TABLE_BUFFER_SIZE (64u * 1024u)
 #define GOODIX_REPORT_RATE_120HZ 0
@@ -22,6 +25,22 @@
 #define GOODIX_REPORT_RATE_360HZ 2
 #define GOODIX_REPORT_RATE_480HZ 3
 #define GOODIX_REPORT_RATE_960HZ 4
+#define UI_WINDOW_WIDTH 760
+#define UI_WINDOW_HEIGHT 560
+#define UI_MARGIN 20
+#define UI_LED_CARD_TOP 74
+#define UI_LED_CARD_HEIGHT 244
+#define UI_TOUCH_CARD_TOP 336
+#define UI_TOUCH_CARD_HEIGHT 120
+#define UI_STATUS_CARD_TOP 474
+#define UI_STATUS_CARD_HEIGHT 60
+
+static const COLORREF kColorWindowBackground = RGB(242, 245, 248);
+static const COLORREF kColorCardBackground = RGB(255, 255, 255);
+static const COLORREF kColorCardBorder = RGB(225, 231, 238);
+static const COLORREF kColorTextPrimary = RGB(26, 32, 44);
+static const COLORREF kColorTextMuted = RGB(96, 108, 128);
+static const COLORREF kColorTextAccent = RGB(17, 94, 89);
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -41,6 +60,12 @@ struct APP_STATE {
     HWND TouchApplyButton;
     HWND TouchInfoText;
     HWND StatusText;
+    HFONT TitleFont;
+    HFONT SectionFont;
+    HFONT BodyFont;
+    HFONT SmallFont;
+    HBRUSH WindowBrush;
+    HBRUSH CardBrush;
     std::vector<AW22XXX_CONFIG_DESCRIPTOR> Configs;
 };
 
@@ -52,6 +77,185 @@ LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
 static BOOL         GetTouchDevicePath(_Out_ std::wstring& DevicePath);
 static BOOL         EnsureTouchDeviceOpen();
+
+static RECT
+MakeRect(
+    LONG Left,
+    LONG Top,
+    LONG Right,
+    LONG Bottom
+    )
+{
+    RECT rect = { Left, Top, Right, Bottom };
+    return rect;
+}
+
+static HFONT
+CreateUiFont(
+    _In_ LONG Height,
+    _In_ LONG Weight
+    )
+{
+    return CreateFontW(
+        Height,
+        0,
+        0,
+        0,
+        Weight,
+        FALSE,
+        FALSE,
+        FALSE,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        VARIABLE_PITCH,
+        L"Segoe UI");
+}
+
+static void
+DestroyUiResources()
+{
+    if (gAppState.TitleFont != nullptr)
+    {
+        DeleteObject(gAppState.TitleFont);
+        gAppState.TitleFont = nullptr;
+    }
+    if (gAppState.SectionFont != nullptr)
+    {
+        DeleteObject(gAppState.SectionFont);
+        gAppState.SectionFont = nullptr;
+    }
+    if (gAppState.BodyFont != nullptr)
+    {
+        DeleteObject(gAppState.BodyFont);
+        gAppState.BodyFont = nullptr;
+    }
+    if (gAppState.SmallFont != nullptr)
+    {
+        DeleteObject(gAppState.SmallFont);
+        gAppState.SmallFont = nullptr;
+    }
+    if (gAppState.WindowBrush != nullptr)
+    {
+        DeleteObject(gAppState.WindowBrush);
+        gAppState.WindowBrush = nullptr;
+    }
+    if (gAppState.CardBrush != nullptr)
+    {
+        DeleteObject(gAppState.CardBrush);
+        gAppState.CardBrush = nullptr;
+    }
+}
+
+static void
+InitializeUiResources()
+{
+    if (gAppState.TitleFont == nullptr)
+    {
+        gAppState.TitleFont = CreateUiFont(-24, FW_SEMIBOLD);
+        gAppState.SectionFont = CreateUiFont(-16, FW_SEMIBOLD);
+        gAppState.BodyFont = CreateUiFont(-16, FW_NORMAL);
+        gAppState.SmallFont = CreateUiFont(-14, FW_NORMAL);
+        gAppState.WindowBrush = CreateSolidBrush(kColorWindowBackground);
+        gAppState.CardBrush = CreateSolidBrush(kColorCardBackground);
+    }
+}
+
+static void
+ApplyFont(
+    _In_opt_ HWND Control,
+    _In_opt_ HFONT Font
+    )
+{
+    if ((Control != nullptr) && (Font != nullptr))
+    {
+        SendMessageW(Control, WM_SETFONT, (WPARAM)Font, TRUE);
+    }
+}
+
+static void
+DrawRoundedCard(
+    _In_ HDC Dc,
+    _In_ const RECT& Rect
+    )
+{
+    HPEN borderPen;
+    HGDIOBJ oldPen;
+    HGDIOBJ oldBrush;
+
+    borderPen = CreatePen(PS_SOLID, 1, kColorCardBorder);
+    oldPen = SelectObject(Dc, borderPen);
+    oldBrush = SelectObject(Dc, gAppState.CardBrush);
+    RoundRect(Dc, Rect.left, Rect.top, Rect.right, Rect.bottom, 16, 16);
+    SelectObject(Dc, oldBrush);
+    SelectObject(Dc, oldPen);
+    DeleteObject(borderPen);
+}
+
+static void
+DrawUiChrome(
+    _In_ HWND Window,
+    _In_ HDC Dc
+    )
+{
+    RECT clientRect;
+    RECT headerRect;
+    RECT ledCardRect;
+    RECT touchCardRect;
+    RECT statusCardRect;
+    HFONT oldFont;
+    COLORREF oldTextColor;
+    int oldBkMode;
+
+    GetClientRect(Window, &clientRect);
+    FillRect(Dc, &clientRect, gAppState.WindowBrush);
+
+    ledCardRect = MakeRect(UI_MARGIN, UI_LED_CARD_TOP, UI_WINDOW_WIDTH - UI_MARGIN, UI_LED_CARD_TOP + UI_LED_CARD_HEIGHT);
+    touchCardRect = MakeRect(UI_MARGIN, UI_TOUCH_CARD_TOP, UI_WINDOW_WIDTH - UI_MARGIN, UI_TOUCH_CARD_TOP + UI_TOUCH_CARD_HEIGHT);
+    statusCardRect = MakeRect(UI_MARGIN, UI_STATUS_CARD_TOP, UI_WINDOW_WIDTH - UI_MARGIN, UI_STATUS_CARD_TOP + UI_STATUS_CARD_HEIGHT);
+
+    DrawRoundedCard(Dc, ledCardRect);
+    DrawRoundedCard(Dc, touchCardRect);
+    DrawRoundedCard(Dc, statusCardRect);
+
+    oldBkMode = SetBkMode(Dc, TRANSPARENT);
+    oldTextColor = SetTextColor(Dc, kColorTextPrimary);
+
+    headerRect = MakeRect(UI_MARGIN, 18, UI_WINDOW_WIDTH - UI_MARGIN, 52);
+    oldFont = (HFONT)SelectObject(Dc, gAppState.TitleFont);
+    DrawTextW(Dc, L"Component Control", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(Dc, gAppState.SmallFont);
+    SetTextColor(Dc, kColorTextMuted);
+    headerRect = MakeRect(UI_MARGIN, 48, UI_WINDOW_WIDTH - UI_MARGIN, 70);
+    DrawTextW(
+        Dc,
+        L"Manage AW22 fan lighting and GT9916R touchscreen settings from one place.",
+        -1,
+        &headerRect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(Dc, gAppState.SectionFont);
+    SetTextColor(Dc, kColorTextAccent);
+    headerRect = MakeRect(ledCardRect.left + 18, ledCardRect.top + 14, ledCardRect.right - 18, ledCardRect.top + 38);
+    DrawTextW(Dc, L"AW22 Lighting", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    headerRect = MakeRect(touchCardRect.left + 18, touchCardRect.top + 14, touchCardRect.right - 18, touchCardRect.top + 38);
+    DrawTextW(Dc, L"GT9916R Touchscreen", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    headerRect = MakeRect(statusCardRect.left + 18, statusCardRect.top + 14, statusCardRect.right - 18, statusCardRect.top + 38);
+    DrawTextW(Dc, L"Status", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(Dc, gAppState.SmallFont);
+    SetTextColor(Dc, kColorTextMuted);
+    headerRect = MakeRect(ledCardRect.left + 24, ledCardRect.top + 48, ledCardRect.right - 24, ledCardRect.top + 66);
+    DrawTextW(Dc, L"LED config", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    headerRect = MakeRect(touchCardRect.left + 24, touchCardRect.top + 48, touchCardRect.right - 24, touchCardRect.top + 66);
+    DrawTextW(Dc, L"Sampling rate", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(Dc, oldFont);
+    SetTextColor(Dc, oldTextColor);
+    SetBkMode(Dc, oldBkMode);
+}
 
 static std::wstring
 FormatWin32Error(
@@ -927,29 +1131,15 @@ CreateMainControls(
     _In_ HWND Window
     )
 {
-    (void)CreateWindowExW(
-        0,
-        L"STATIC",
-        L"Config:",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        18,
-        64,
-        20,
-        Window,
-        nullptr,
-        hInst,
-        nullptr);
-
     gAppState.ConfigCombo = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
+        0,
         L"COMBOBOX",
         nullptr,
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST,
-        84,
-        14,
-        320,
-        320,
+        42,
+        138,
+        458,
+        260,
         Window,
         (HMENU)IDC_CONFIG_COMBO,
         hInst,
@@ -958,12 +1148,12 @@ CreateMainControls(
     gAppState.ApplyButton = CreateWindowExW(
         0,
         L"BUTTON",
-        L"Apply",
+        L"Apply Config",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        416,
-        14,
-        104,
-        28,
+        526,
+        136,
+        188,
+        32,
         Window,
         (HMENU)IDC_APPLY_BUTTON,
         hInst,
@@ -974,10 +1164,10 @@ CreateMainControls(
         L"BUTTON",
         L"Refresh",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        416,
-        52,
-        104,
-        28,
+        526,
+        176,
+        188,
+        32,
         Window,
         (HMENU)IDC_REFRESH_BUTTON,
         hInst,
@@ -986,12 +1176,12 @@ CreateMainControls(
     gAppState.OffButton = CreateWindowExW(
         0,
         L"BUTTON",
-        L"Off",
+        L"Disable LED",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        416,
-        90,
-        104,
-        28,
+        526,
+        216,
+        188,
+        32,
         Window,
         (HMENU)IDC_OFF_BUTTON,
         hInst,
@@ -1002,9 +1192,9 @@ CreateMainControls(
         L"BUTTON",
         L"Use RGB override",
         WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        84,
-        52,
-        200,
+        42,
+        178,
+        220,
         24,
         Window,
         (HMENU)IDC_RGB_CHECK,
@@ -1012,41 +1202,27 @@ CreateMainControls(
         nullptr);
 
     gAppState.InfoText = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
+        0,
         L"STATIC",
         L"",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
-        16,
-        90,
-        388,
-        120,
+        42,
+        204,
+        456,
+        88,
         Window,
         (HMENU)IDC_INFO_TEXT,
         hInst,
         nullptr);
 
-    (void)CreateWindowExW(
-        0,
-        L"STATIC",
-        L"Touch rate:",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        226,
-        92,
-        20,
-        Window,
-        nullptr,
-        hInst,
-        nullptr);
-
     gAppState.TouchRateCombo = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
+        0,
         L"COMBOBOX",
         nullptr,
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST,
-        112,
-        222,
-        160,
+        42,
+        398,
+        220,
         200,
         Window,
         (HMENU)IDC_TOUCH_RATE_COMBO,
@@ -1056,26 +1232,26 @@ CreateMainControls(
     gAppState.TouchApplyButton = CreateWindowExW(
         0,
         L"BUTTON",
-        L"Set Rate",
+        L"Apply Rate",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        288,
-        222,
-        116,
-        28,
+        280,
+        396,
+        144,
+        32,
         Window,
         (HMENU)IDC_TOUCH_APPLY_BUTTON,
         hInst,
         nullptr);
 
     gAppState.TouchInfoText = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
+        0,
         L"STATIC",
         L"",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
-        16,
-        262,
-        504,
-        48,
+        42,
+        434,
+        672,
+        26,
         Window,
         (HMENU)IDC_TOUCH_INFO_TEXT,
         hInst,
@@ -1086,14 +1262,25 @@ CreateMainControls(
         L"STATIC",
         L"Connecting...",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
-        16,
-        322,
-        504,
-        20,
+        42,
+        506,
+        672,
+        26,
         Window,
         (HMENU)IDC_STATUS_TEXT,
         hInst,
         nullptr);
+
+    ApplyFont(gAppState.ConfigCombo, gAppState.BodyFont);
+    ApplyFont(gAppState.ApplyButton, gAppState.BodyFont);
+    ApplyFont(gAppState.RefreshButton, gAppState.BodyFont);
+    ApplyFont(gAppState.OffButton, gAppState.BodyFont);
+    ApplyFont(gAppState.RgbCheck, gAppState.BodyFont);
+    ApplyFont(gAppState.InfoText, gAppState.SmallFont);
+    ApplyFont(gAppState.TouchRateCombo, gAppState.BodyFont);
+    ApplyFont(gAppState.TouchApplyButton, gAppState.BodyFont);
+    ApplyFont(gAppState.TouchInfoText, gAppState.SmallFont);
+    ApplyFont(gAppState.StatusText, gAppState.BodyFont);
 }
 
 int APIENTRY
@@ -1106,9 +1293,12 @@ wWinMain(
 {
     MSG msg;
     HACCEL hAccelTable;
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES };
 
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
+
+    InitCommonControlsEx(&icc);
 
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_COMPONENTCTRL, szWindowClass, MAX_LOADSTRING);
@@ -1146,7 +1336,7 @@ MyRegisterClass(
     wcex.hInstance = hInstance;
     wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_COMPONENTCTRL));
     wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcex.hbrBackground = nullptr;
     wcex.lpszMenuName = MAKEINTRESOURCEW(IDC_COMPONENTCTRL);
     wcex.lpszClassName = szWindowClass;
     wcex.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL));
@@ -1161,16 +1351,21 @@ InitInstance(
     )
 {
     HWND hWnd;
+    DWORD windowStyle;
+    RECT windowRect;
 
     hInst = hInstance;
+    windowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    windowRect = MakeRect(0, 0, UI_WINDOW_WIDTH, UI_WINDOW_HEIGHT);
+    AdjustWindowRect(&windowRect, windowStyle, TRUE);
     hWnd = CreateWindowW(
         szWindowClass,
         szTitle,
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        windowStyle,
         CW_USEDEFAULT,
         0,
-        552,
-        420,
+        windowRect.right - windowRect.left,
+        windowRect.bottom - windowRect.top,
         nullptr,
         nullptr,
         hInstance,
@@ -1199,10 +1394,47 @@ WndProc(
     switch (message)
     {
     case WM_CREATE:
+        InitializeUiResources();
         CreateMainControls(hWnd);
         EnableInteractiveControls(FALSE, FALSE, FALSE);
         RefreshUi();
         return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc;
+
+        hdc = BeginPaint(hWnd, &ps);
+        DrawUiChrome(hWnd, hdc);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = (HDC)wParam;
+        HWND control = (HWND)lParam;
+
+        SetBkMode(hdc, TRANSPARENT);
+        if (control == gAppState.StatusText)
+        {
+            SetTextColor(hdc, kColorTextPrimary);
+        }
+        else if ((control == gAppState.InfoText) || (control == gAppState.TouchInfoText))
+        {
+            SetTextColor(hdc, kColorTextMuted);
+        }
+        else
+        {
+            SetTextColor(hdc, kColorTextPrimary);
+        }
+
+        return (LRESULT)GetStockObject(NULL_BRUSH);
+    }
 
     case WM_COMMAND:
         switch (LOWORD(wParam))
@@ -1238,6 +1470,7 @@ WndProc(
     case WM_DESTROY:
         CloseDeviceHandle();
         CloseTouchDeviceHandle();
+        DestroyUiResources();
         PostQuitMessage(0);
         return 0;
     }
