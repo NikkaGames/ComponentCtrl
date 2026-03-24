@@ -93,6 +93,7 @@ typedef struct _DROPDOWN_SWIPE_STATE {
     HWND ListWindow;
     BOOL Tracking;
     BOOL Dragging;
+    UINT PointerId;
     POINT StartPoint;
     INT StartTopIndex;
 } DROPDOWN_SWIPE_STATE, *PDROPDOWN_SWIPE_STATE;
@@ -473,6 +474,7 @@ ResetDropdownSwipeState(
     gDropdownSwipeState.ListWindow = nullptr;
     gDropdownSwipeState.Tracking = FALSE;
     gDropdownSwipeState.Dragging = FALSE;
+    gDropdownSwipeState.PointerId = 0;
     gDropdownSwipeState.StartPoint.x = 0;
     gDropdownSwipeState.StartPoint.y = 0;
     gDropdownSwipeState.StartTopIndex = 0;
@@ -493,24 +495,42 @@ ComboListSubclassProc(
 
     switch (Message)
     {
-    case WM_LBUTTONDOWN:
+    case WM_POINTERDOWN:
     {
+        POINTER_INPUT_TYPE pointerType;
+        RECT clientRect;
         POINT point;
+        UINT pointerId;
+
+        pointerId = GET_POINTERID_WPARAM(WParam);
+        if (!GetPointerType(pointerId, &pointerType) || (pointerType != PT_TOUCH))
+        {
+            break;
+        }
 
         point.x = GET_X_LPARAM(LParam);
         point.y = GET_Y_LPARAM(LParam);
+        ScreenToClient(Window, &point);
+        GetClientRect(Window, &clientRect);
+        if (point.x >= (clientRect.right - GetSystemMetrics(SM_CXVSCROLL)))
+        {
+            break;
+        }
+
         gDropdownSwipeState.ListWindow = Window;
         gDropdownSwipeState.Tracking = TRUE;
         gDropdownSwipeState.Dragging = FALSE;
+        gDropdownSwipeState.PointerId = pointerId;
         gDropdownSwipeState.StartPoint = point;
         gDropdownSwipeState.StartTopIndex = (INT)SendMessageW(Window, LB_GETTOPINDEX, 0, 0);
         SetCapture(Window);
         break;
     }
 
-    case WM_MOUSEMOVE:
+    case WM_POINTERUPDATE:
         if (gDropdownSwipeState.Tracking
             && (gDropdownSwipeState.ListWindow == Window)
+            && (gDropdownSwipeState.PointerId == GET_POINTERID_WPARAM(WParam))
             && (GetCapture() == Window))
         {
             POINT point;
@@ -518,6 +538,7 @@ ComboListSubclassProc(
 
             point.x = GET_X_LPARAM(LParam);
             point.y = GET_Y_LPARAM(LParam);
+            ScreenToClient(Window, &point);
             deltaY = point.y - gDropdownSwipeState.StartPoint.y;
 
             if (!gDropdownSwipeState.Dragging && (abs(deltaY) >= COMBO_SWIPE_THRESHOLD))
@@ -547,8 +568,10 @@ ComboListSubclassProc(
         }
         break;
 
-    case WM_LBUTTONUP:
-        if (gDropdownSwipeState.Tracking && (gDropdownSwipeState.ListWindow == Window))
+    case WM_POINTERUP:
+        if (gDropdownSwipeState.Tracking
+            && (gDropdownSwipeState.ListWindow == Window)
+            && (gDropdownSwipeState.PointerId == GET_POINTERID_WPARAM(WParam)))
         {
             BOOL wasDragging = gDropdownSwipeState.Dragging;
 
@@ -566,6 +589,43 @@ ComboListSubclassProc(
             ResetDropdownSwipeState(nullptr);
         }
         break;
+
+    case WM_MOUSEWHEEL:
+    {
+        short wheelDelta;
+        INT itemHeight;
+        INT count;
+        INT topIndex;
+        INT deltaItems;
+
+        wheelDelta = GET_WHEEL_DELTA_WPARAM(WParam);
+        if (wheelDelta == 0)
+        {
+            break;
+        }
+
+        itemHeight = (INT)SendMessageW(Window, LB_GETITEMHEIGHT, 0, 0);
+        if (itemHeight <= 0)
+        {
+            itemHeight = 16;
+        }
+
+        count = (INT)SendMessageW(Window, LB_GETCOUNT, 0, 0);
+        topIndex = (INT)SendMessageW(Window, LB_GETTOPINDEX, 0, 0);
+        deltaItems = max(abs(wheelDelta) / WHEEL_DELTA, 1);
+        if (wheelDelta > 0)
+        {
+            topIndex -= deltaItems;
+        }
+        else
+        {
+            topIndex += deltaItems;
+        }
+
+        topIndex = ClampInt(topIndex, 0, max(count - 1, 0));
+        SendMessageW(Window, LB_SETTOPINDEX, (WPARAM)topIndex, 0);
+        return 0;
+    }
 
     case WM_NCDESTROY:
         if (gDropdownSwipeState.ListWindow == Window)
