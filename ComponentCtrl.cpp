@@ -31,9 +31,9 @@
 #define UI_MIN_CLIENT_HEIGHT 560
 #define UI_MARGIN 20
 #define UI_LED_CARD_TOP 82
-#define UI_LED_CARD_HEIGHT 272
-#define UI_TOUCH_CARD_HEIGHT 152
-#define UI_STATUS_CARD_HEIGHT 104
+#define UI_LED_CARD_HEIGHT 300
+#define UI_TOUCH_CARD_HEIGHT 180
+#define UI_STATUS_CARD_HEIGHT 116
 #define UI_CARD_GAP 18
 #define UI_SCROLL_STEP 48
 #define UI_LED_ACTION_WIDTH 188
@@ -298,9 +298,9 @@ ComputeUiLayout(
         Layout->LedCardRect.top + 140 + UI_CONTROL_HEIGHT);
     Layout->InfoTextRect = MakeRect(
         ledInnerLeft,
-        Layout->LedCardRect.top + 144,
+        Layout->LedCardRect.top + 192,
         ledInnerRight,
-        Layout->LedCardRect.bottom - 20);
+        Layout->LedCardRect.bottom - 22);
 
     touchInnerLeft = Layout->TouchCardRect.left + 22;
     touchInnerRight = Layout->TouchCardRect.right - 22;
@@ -316,15 +316,15 @@ ComputeUiLayout(
         Layout->TouchCardRect.top + 62 + UI_CONTROL_HEIGHT);
     Layout->TouchInfoTextRect = MakeRect(
         touchInnerLeft,
-        Layout->TouchCardRect.top + 96,
+        Layout->TouchCardRect.top + 118,
         touchInnerRight,
-        Layout->TouchCardRect.bottom - 18);
+        Layout->TouchCardRect.bottom - 20);
 
     Layout->StatusTextRect = MakeRect(
         Layout->StatusCardRect.left + 22,
-        Layout->StatusCardRect.top + 38,
+        Layout->StatusCardRect.top + 46,
         Layout->StatusCardRect.right - 22,
-        Layout->StatusCardRect.bottom - 16);
+        Layout->StatusCardRect.bottom - 20);
 
     Layout->ContentHeight = statusCardTop + UI_STATUS_CARD_HEIGHT + UI_MARGIN;
 }
@@ -343,7 +343,7 @@ MoveChildControl(
             Rect.top,
             Rect.right - Rect.left,
             Rect.bottom - Rect.top,
-            TRUE);
+            FALSE);
     }
 }
 
@@ -401,7 +401,11 @@ ApplyLayout(
 
     if (RedrawWindowNow)
     {
-        RedrawWindow(Window, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        RedrawWindow(
+            Window,
+            nullptr,
+            nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     }
 }
 
@@ -1668,7 +1672,8 @@ InitInstance(
     windowStyle = WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_CLIPCHILDREN;
     windowRect = MakeRect(0, 0, UI_INITIAL_CLIENT_WIDTH, UI_INITIAL_CLIENT_HEIGHT);
     AdjustWindowRect(&windowRect, windowStyle, TRUE);
-    hWnd = CreateWindowW(
+    hWnd = CreateWindowExW(
+        WS_EX_COMPOSITED,
         szWindowClass,
         szTitle,
         windowStyle,
@@ -1804,17 +1809,23 @@ WndProc(
         HDC hdc = (HDC)wParam;
         HWND control = (HWND)lParam;
 
-        SetBkMode(hdc, TRANSPARENT);
         if (control == gAppState.StatusText)
         {
+            SetBkMode(hdc, OPAQUE);
+            SetBkColor(hdc, kColorCardBackground);
             SetTextColor(hdc, kColorTextPrimary);
+            return (LRESULT)gAppState.CardBrush;
         }
         else if ((control == gAppState.InfoText) || (control == gAppState.TouchInfoText))
         {
+            SetBkMode(hdc, OPAQUE);
+            SetBkColor(hdc, kColorCardBackground);
             SetTextColor(hdc, kColorTextMuted);
+            return (LRESULT)gAppState.CardBrush;
         }
         else
         {
+            SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, kColorTextPrimary);
         }
 
