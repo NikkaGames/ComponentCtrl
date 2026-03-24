@@ -491,7 +491,6 @@ ComboListSubclassProc(
     )
 {
     UNREFERENCED_PARAMETER(SubclassId);
-    UNREFERENCED_PARAMETER(ReferenceData);
 
     switch (Message)
     {
@@ -524,7 +523,7 @@ ComboListSubclassProc(
         gDropdownSwipeState.StartPoint = point;
         gDropdownSwipeState.StartTopIndex = (INT)SendMessageW(Window, LB_GETTOPINDEX, 0, 0);
         SetCapture(Window);
-        break;
+        return 0;
     }
 
     case WM_POINTERUPDATE:
@@ -565,6 +564,8 @@ ComboListSubclassProc(
                 SendMessageW(Window, LB_SETTOPINDEX, (WPARAM)topIndex, 0);
                 return 0;
             }
+
+            return 0;
         }
         break;
 
@@ -573,13 +574,49 @@ ComboListSubclassProc(
             && (gDropdownSwipeState.ListWindow == Window)
             && (gDropdownSwipeState.PointerId == GET_POINTERID_WPARAM(WParam)))
         {
+            HWND comboBox;
             BOOL wasDragging = gDropdownSwipeState.Dragging;
+            POINT point;
 
+            comboBox = (HWND)ReferenceData;
+            point.x = GET_X_LPARAM(LParam);
+            point.y = GET_Y_LPARAM(LParam);
+            ScreenToClient(Window, &point);
             ResetDropdownSwipeState(Window);
             if (wasDragging)
             {
                 return 0;
             }
+
+            if (comboBox != nullptr)
+            {
+                LRESULT itemFromPoint;
+                INT itemIndex;
+
+                itemFromPoint = SendMessageW(
+                    Window,
+                    LB_ITEMFROMPOINT,
+                    0,
+                    MAKELPARAM(point.x, point.y));
+                itemIndex = LOWORD(itemFromPoint);
+                if ((HIWORD(itemFromPoint) == 0) && (itemIndex >= 0))
+                {
+                    SendMessageW(comboBox, CB_SETCURSEL, (WPARAM)itemIndex, 0);
+                    SendMessageW(comboBox, CB_SHOWDROPDOWN, FALSE, 0);
+                    return 0;
+                }
+            }
+
+            return 0;
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_MOUSEMOVE:
+        if (gDropdownSwipeState.Tracking && (gDropdownSwipeState.ListWindow == Window))
+        {
+            return 0;
         }
         break;
 
@@ -660,7 +697,11 @@ AttachSwipeScrollToCombo(
 
     if (comboInfo.hwndList != nullptr)
     {
-        SetWindowSubclass(comboInfo.hwndList, ComboListSubclassProc, COMBO_SWIPE_SUBCLASS_ID, 0);
+        SetWindowSubclass(
+            comboInfo.hwndList,
+            ComboListSubclassProc,
+            COMBO_SWIPE_SUBCLASS_ID,
+            (DWORD_PTR)ComboBox);
     }
 }
 
