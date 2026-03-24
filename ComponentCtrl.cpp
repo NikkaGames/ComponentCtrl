@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <initguid.h>
 #include <setupapi.h>
+#include <shellapi.h>
 #include <strsafe.h>
 #include <winioctl.h>
 #include <vector>
@@ -17,6 +18,7 @@
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shell32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define MAX_LOADSTRING 100
 #define CONFIG_TABLE_BUFFER_SIZE (64u * 1024u)
@@ -42,6 +44,8 @@
 #define UI_CONTROL_HEIGHT 32
 #define ID_ABOUT_AUTHOR_TEXT  50001
 #define ID_ABOUT_LINK_TEXT    50002
+#define COMBO_SWIPE_SUBCLASS_ID 1u
+#define COMBO_SWIPE_THRESHOLD 6
 
 static const COLORREF kColorWindowBackground = RGB(242, 245, 248);
 static const COLORREF kColorCardBackground = RGB(255, 255, 255);
@@ -85,12 +89,23 @@ struct APP_STATE {
 
 static APP_STATE gAppState = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
 
+typedef struct _DROPDOWN_SWIPE_STATE {
+    HWND ListWindow;
+    BOOL Tracking;
+    BOOL Dragging;
+    POINT StartPoint;
+    INT StartTopIndex;
+} DROPDOWN_SWIPE_STATE, *PDROPDOWN_SWIPE_STATE;
+
+static DROPDOWN_SWIPE_STATE gDropdownSwipeState = {};
+
 ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
 static BOOL         GetTouchDevicePath(_Out_ std::wstring& DevicePath);
 static BOOL         EnsureTouchDeviceOpen();
+static void         AttachSwipeScrollToCombo(_In_opt_ HWND ComboBox);
 
 typedef struct _UI_LAYOUT {
     RECT HeaderTitleRect;
@@ -310,7 +325,7 @@ ComputeUiLayout(
         Layout->LedCardRect.top + 190 + UI_CONTROL_HEIGHT);
     Layout->InfoTextRect = MakeRect(
         ledInnerLeft,
-        Layout->LedCardRect.top + 148,
+        Layout->LedCardRect.top + 140,
         ledMainRight,
         Layout->LedCardRect.bottom - 22);
 
@@ -443,6 +458,150 @@ ScrollToPosition(
 
     gAppState.ScrollY = NewScrollY;
     ApplyLayout(Window, TRUE);
+}
+
+static void
+ResetDropdownSwipeState(
+    _In_opt_ HWND ListWindow
+    )
+{
+    if ((ListWindow != nullptr) && (GetCapture() == ListWindow))
+    {
+        ReleaseCapture();
+    }
+
+    gDropdownSwipeState.ListWindow = nullptr;
+    gDropdownSwipeState.Tracking = FALSE;
+    gDropdownSwipeState.Dragging = FALSE;
+    gDropdownSwipeState.StartPoint.x = 0;
+    gDropdownSwipeState.StartPoint.y = 0;
+    gDropdownSwipeState.StartTopIndex = 0;
+}
+
+static LRESULT CALLBACK
+ComboListSubclassProc(
+    HWND Window,
+    UINT Message,
+    WPARAM WParam,
+    LPARAM LParam,
+    UINT_PTR SubclassId,
+    DWORD_PTR ReferenceData
+    )
+{
+    UNREFERENCED_PARAMETER(SubclassId);
+    UNREFERENCED_PARAMETER(ReferenceData);
+
+    switch (Message)
+    {
+    case WM_LBUTTONDOWN:
+    {
+        POINT point;
+
+        point.x = GET_X_LPARAM(LParam);
+        point.y = GET_Y_LPARAM(LParam);
+        gDropdownSwipeState.ListWindow = Window;
+        gDropdownSwipeState.Tracking = TRUE;
+        gDropdownSwipeState.Dragging = FALSE;
+        gDropdownSwipeState.StartPoint = point;
+        gDropdownSwipeState.StartTopIndex = (INT)SendMessageW(Window, LB_GETTOPINDEX, 0, 0);
+        SetCapture(Window);
+        break;
+    }
+
+    case WM_MOUSEMOVE:
+        if (gDropdownSwipeState.Tracking
+            && (gDropdownSwipeState.ListWindow == Window)
+            && (GetCapture() == Window))
+        {
+            POINT point;
+            INT deltaY;
+
+            point.x = GET_X_LPARAM(LParam);
+            point.y = GET_Y_LPARAM(LParam);
+            deltaY = point.y - gDropdownSwipeState.StartPoint.y;
+
+            if (!gDropdownSwipeState.Dragging && (abs(deltaY) >= COMBO_SWIPE_THRESHOLD))
+            {
+                gDropdownSwipeState.Dragging = TRUE;
+            }
+
+            if (gDropdownSwipeState.Dragging)
+            {
+                INT itemHeight;
+                INT count;
+                INT scrollUnits;
+                INT topIndex;
+
+                itemHeight = (INT)SendMessageW(Window, LB_GETITEMHEIGHT, 0, 0);
+                if (itemHeight <= 0)
+                {
+                    itemHeight = 16;
+                }
+
+                count = (INT)SendMessageW(Window, LB_GETCOUNT, 0, 0);
+                scrollUnits = (gDropdownSwipeState.StartPoint.y - point.y) / max(itemHeight / 2, 1);
+                topIndex = ClampInt(gDropdownSwipeState.StartTopIndex + scrollUnits, 0, max(count - 1, 0));
+                SendMessageW(Window, LB_SETTOPINDEX, (WPARAM)topIndex, 0);
+                return 0;
+            }
+        }
+        break;
+
+    case WM_LBUTTONUP:
+        if (gDropdownSwipeState.Tracking && (gDropdownSwipeState.ListWindow == Window))
+        {
+            BOOL wasDragging = gDropdownSwipeState.Dragging;
+
+            ResetDropdownSwipeState(Window);
+            if (wasDragging)
+            {
+                return 0;
+            }
+        }
+        break;
+
+    case WM_CAPTURECHANGED:
+        if (gDropdownSwipeState.ListWindow == Window)
+        {
+            ResetDropdownSwipeState(nullptr);
+        }
+        break;
+
+    case WM_NCDESTROY:
+        if (gDropdownSwipeState.ListWindow == Window)
+        {
+            ResetDropdownSwipeState(nullptr);
+        }
+        RemoveWindowSubclass(Window, ComboListSubclassProc, COMBO_SWIPE_SUBCLASS_ID);
+        break;
+    }
+
+    return DefSubclassProc(Window, Message, WParam, LParam);
+}
+
+static void
+AttachSwipeScrollToCombo(
+    _In_opt_ HWND ComboBox
+    )
+{
+    COMBOBOXINFO comboInfo;
+
+    if (ComboBox == nullptr)
+    {
+        return;
+    }
+
+    ZeroMemory(&comboInfo, sizeof(comboInfo));
+    comboInfo.cbSize = sizeof(comboInfo);
+    if (!GetComboBoxInfo(ComboBox, &comboInfo))
+    {
+        return;
+    }
+
+    if (comboInfo.hwndList != nullptr)
+    {
+        SetWindowSubclass(comboInfo.hwndList, ComboListSubclassProc, COMBO_SWIPE_SUBCLASS_ID, 0);
+    }
 }
 
 static void
@@ -1709,6 +1868,8 @@ CreateMainControls(
     ApplyFont(gAppState.TouchApplyButton, gAppState.BodyFont);
     ApplyFont(gAppState.TouchInfoText, gAppState.SmallFont);
     ApplyFont(gAppState.StatusText, gAppState.SmallFont);
+    AttachSwipeScrollToCombo(gAppState.ConfigCombo);
+    AttachSwipeScrollToCombo(gAppState.TouchRateCombo);
 }
 
 int APIENTRY
@@ -1949,6 +2110,22 @@ WndProc(
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
+        case IDC_CONFIG_COMBO:
+            if (HIWORD(wParam) == CBN_DROPDOWN)
+            {
+                AttachSwipeScrollToCombo((HWND)lParam);
+                return 0;
+            }
+            break;
+
+        case IDC_TOUCH_RATE_COMBO:
+            if (HIWORD(wParam) == CBN_DROPDOWN)
+            {
+                AttachSwipeScrollToCombo((HWND)lParam);
+                return 0;
+            }
+            break;
+
         case IDC_APPLY_BUTTON:
             ApplySelectedConfig();
             return 0;
@@ -2069,7 +2246,7 @@ About(
             0,
             L"STATIC",
             L"https://t.me/RedMagicWoA",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY,
             pixelRect.left,
             pixelRect.top,
             pixelRect.right - pixelRect.left,
@@ -2087,6 +2264,18 @@ About(
     }
 
     case WM_COMMAND:
+        if ((LOWORD(wParam) == ID_ABOUT_LINK_TEXT) && (HIWORD(wParam) == STN_CLICKED))
+        {
+            (void)ShellExecuteW(
+                hDlg,
+                L"open",
+                L"https://t.me/RedMagicWoA",
+                nullptr,
+                nullptr,
+                SW_SHOWNORMAL);
+            return (INT_PTR)TRUE;
+        }
+
         if ((LOWORD(wParam) == IDOK) || (LOWORD(wParam) == IDCANCEL))
         {
             EndDialog(hDlg, LOWORD(wParam));
