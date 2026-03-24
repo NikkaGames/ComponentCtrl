@@ -93,7 +93,7 @@ typedef struct _DROPDOWN_SWIPE_STATE {
     HWND ListWindow;
     BOOL Tracking;
     BOOL Dragging;
-    UINT PointerId;
+    DWORD ContactId;
     POINT StartPoint;
     INT StartTopIndex;
 } DROPDOWN_SWIPE_STATE, *PDROPDOWN_SWIPE_STATE;
@@ -474,7 +474,7 @@ ResetDropdownSwipeState(
     gDropdownSwipeState.ListWindow = nullptr;
     gDropdownSwipeState.Tracking = FALSE;
     gDropdownSwipeState.Dragging = FALSE;
-    gDropdownSwipeState.PointerId = 0;
+    gDropdownSwipeState.ContactId = 0;
     gDropdownSwipeState.StartPoint.x = 0;
     gDropdownSwipeState.StartPoint.y = 0;
     gDropdownSwipeState.StartTopIndex = 0;
@@ -494,6 +494,135 @@ ComboListSubclassProc(
 
     switch (Message)
     {
+    case WM_TOUCH:
+    {
+        UINT inputCount;
+        PTOUCHINPUT touchInputs;
+        BOOL handled;
+
+        inputCount = LOWORD(WParam);
+        handled = FALSE;
+        touchInputs = (PTOUCHINPUT)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(TOUCHINPUT) * inputCount);
+        if (touchInputs == nullptr)
+        {
+            CloseTouchInputHandle((HTOUCHINPUT)LParam);
+            return 0;
+        }
+
+        if (GetTouchInputInfo((HTOUCHINPUT)LParam, inputCount, touchInputs, sizeof(TOUCHINPUT)))
+        {
+            UINT index;
+            HWND comboBox;
+
+            comboBox = (HWND)ReferenceData;
+            for (index = 0; index < inputCount; index++)
+            {
+                TOUCHINPUT* touch;
+                POINT point;
+                RECT clientRect;
+
+                touch = &touchInputs[index];
+                point.x = TOUCH_COORD_TO_PIXEL(touch->x);
+                point.y = TOUCH_COORD_TO_PIXEL(touch->y);
+                ScreenToClient(Window, &point);
+                GetClientRect(Window, &clientRect);
+
+                if ((touch->dwFlags & TOUCHEVENTF_DOWN) != 0)
+                {
+                    if (point.x >= (clientRect.right - GetSystemMetrics(SM_CXVSCROLL)))
+                    {
+                        continue;
+                    }
+
+                    gDropdownSwipeState.ListWindow = Window;
+                    gDropdownSwipeState.Tracking = TRUE;
+                    gDropdownSwipeState.Dragging = FALSE;
+                    gDropdownSwipeState.ContactId = touch->dwID;
+                    gDropdownSwipeState.StartPoint = point;
+                    gDropdownSwipeState.StartTopIndex = (INT)SendMessageW(Window, LB_GETTOPINDEX, 0, 0);
+                    SetCapture(Window);
+                    handled = TRUE;
+                }
+                else if ((touch->dwFlags & TOUCHEVENTF_MOVE) != 0)
+                {
+                    if (gDropdownSwipeState.Tracking
+                        && (gDropdownSwipeState.ListWindow == Window)
+                        && (gDropdownSwipeState.ContactId == touch->dwID)
+                        && (GetCapture() == Window))
+                    {
+                        INT deltaY;
+
+                        deltaY = point.y - gDropdownSwipeState.StartPoint.y;
+                        if (!gDropdownSwipeState.Dragging && (abs(deltaY) >= COMBO_SWIPE_THRESHOLD))
+                        {
+                            gDropdownSwipeState.Dragging = TRUE;
+                        }
+
+                        if (gDropdownSwipeState.Dragging)
+                        {
+                            INT itemHeight;
+                            INT count;
+                            INT scrollUnits;
+                            INT topIndex;
+
+                            itemHeight = (INT)SendMessageW(Window, LB_GETITEMHEIGHT, 0, 0);
+                            if (itemHeight <= 0)
+                            {
+                                itemHeight = 16;
+                            }
+
+                            count = (INT)SendMessageW(Window, LB_GETCOUNT, 0, 0);
+                            scrollUnits = (gDropdownSwipeState.StartPoint.y - point.y) / max(itemHeight / 2, 1);
+                            topIndex = ClampInt(gDropdownSwipeState.StartTopIndex + scrollUnits, 0, max(count - 1, 0));
+                            SendMessageW(Window, LB_SETTOPINDEX, (WPARAM)topIndex, 0);
+                        }
+
+                        handled = TRUE;
+                    }
+                }
+                else if ((touch->dwFlags & TOUCHEVENTF_UP) != 0)
+                {
+                    if (gDropdownSwipeState.Tracking
+                        && (gDropdownSwipeState.ListWindow == Window)
+                        && (gDropdownSwipeState.ContactId == touch->dwID))
+                    {
+                        BOOL wasDragging;
+
+                        wasDragging = gDropdownSwipeState.Dragging;
+                        ResetDropdownSwipeState(Window);
+                        if (!wasDragging && (comboBox != nullptr))
+                        {
+                            LRESULT itemFromPoint;
+                            INT itemIndex;
+
+                            itemFromPoint = SendMessageW(
+                                Window,
+                                LB_ITEMFROMPOINT,
+                                0,
+                                MAKELPARAM(point.x, point.y));
+                            itemIndex = LOWORD(itemFromPoint);
+                            if ((HIWORD(itemFromPoint) == 0) && (itemIndex >= 0))
+                            {
+                                SendMessageW(comboBox, CB_SETCURSEL, (WPARAM)itemIndex, 0);
+                                SendMessageW(comboBox, CB_SHOWDROPDOWN, FALSE, 0);
+                            }
+                        }
+
+                        handled = TRUE;
+                    }
+                }
+            }
+        }
+
+        HeapFree(GetProcessHeap(), 0, touchInputs);
+        CloseTouchInputHandle((HTOUCHINPUT)LParam);
+        if (handled)
+        {
+            return 0;
+        }
+        break;
+    }
+
     case WM_POINTERDOWN:
     {
         POINTER_INPUT_TYPE pointerType;
@@ -519,7 +648,7 @@ ComboListSubclassProc(
         gDropdownSwipeState.ListWindow = Window;
         gDropdownSwipeState.Tracking = TRUE;
         gDropdownSwipeState.Dragging = FALSE;
-        gDropdownSwipeState.PointerId = pointerId;
+        gDropdownSwipeState.ContactId = pointerId;
         gDropdownSwipeState.StartPoint = point;
         gDropdownSwipeState.StartTopIndex = (INT)SendMessageW(Window, LB_GETTOPINDEX, 0, 0);
         SetCapture(Window);
@@ -529,7 +658,7 @@ ComboListSubclassProc(
     case WM_POINTERUPDATE:
         if (gDropdownSwipeState.Tracking
             && (gDropdownSwipeState.ListWindow == Window)
-            && (gDropdownSwipeState.PointerId == GET_POINTERID_WPARAM(WParam))
+            && (gDropdownSwipeState.ContactId == GET_POINTERID_WPARAM(WParam))
             && (GetCapture() == Window))
         {
             POINT point;
@@ -572,7 +701,7 @@ ComboListSubclassProc(
     case WM_POINTERUP:
         if (gDropdownSwipeState.Tracking
             && (gDropdownSwipeState.ListWindow == Window)
-            && (gDropdownSwipeState.PointerId == GET_POINTERID_WPARAM(WParam)))
+            && (gDropdownSwipeState.ContactId == GET_POINTERID_WPARAM(WParam)))
         {
             HWND comboBox;
             BOOL wasDragging = gDropdownSwipeState.Dragging;
@@ -697,6 +826,7 @@ AttachSwipeScrollToCombo(
 
     if (comboInfo.hwndList != nullptr)
     {
+        RegisterTouchWindow(comboInfo.hwndList, 0);
         SetWindowSubclass(
             comboInfo.hwndList,
             ComboListSubclassProc,
