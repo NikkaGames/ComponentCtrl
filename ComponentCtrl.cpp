@@ -48,6 +48,8 @@
 #define PICKER_ITEM_HEIGHT 36
 #define PICKER_MAX_VISIBLE_ITEMS 8
 #define PICKER_DRAG_THRESHOLD 6
+#define MI_WP_SIGNATURE 0xFF515700
+#define MI_WP_SIGNATURE_MASK 0xFFFFFF00
 
 static const COLORREF kColorWindowBackground = RGB(242, 245, 248);
 static const COLORREF kColorCardBackground = RGB(255, 255, 255);
@@ -511,6 +513,12 @@ ResetPickerTracking()
     gPickerState.StartPoint.x = 0;
     gPickerState.StartPoint.y = 0;
     gPickerState.StartTopIndex = 0;
+}
+
+static BOOL
+IsTouchPromotedMouseMessage()
+{
+    return ((((ULONG_PTR)GetMessageExtraInfo()) & MI_WP_SIGNATURE_MASK) == MI_WP_SIGNATURE);
 }
 
 static INT
@@ -1000,7 +1008,94 @@ PickerPopupWndProc(
         return 0;
     }
 
+    case WM_POINTERDOWN:
+    {
+        POINTER_INPUT_TYPE pointerType;
+        POINT point;
+
+        if (!GetPointerType(GET_POINTERID_WPARAM(WParam), &pointerType)
+            || ((pointerType != PT_TOUCH) && (pointerType != PT_PEN)))
+        {
+            break;
+        }
+
+        point.x = GET_X_LPARAM(LParam);
+        point.y = GET_Y_LPARAM(LParam);
+        ScreenToClient(Window, &point);
+        gPickerState.Tracking = TRUE;
+        gPickerState.Dragging = FALSE;
+        gPickerState.ContactId = GET_POINTERID_WPARAM(WParam);
+        gPickerState.StartPoint = point;
+        gPickerState.StartTopIndex = gPickerState.TopIndex;
+        SetCapture(Window);
+        return 0;
+    }
+
+    case WM_POINTERUPDATE:
+        if (gPickerState.Tracking && (gPickerState.ContactId == GET_POINTERID_WPARAM(WParam)))
+        {
+            POINTER_INPUT_TYPE pointerType;
+            POINT point;
+            INT deltaY;
+
+            if (!GetPointerType(GET_POINTERID_WPARAM(WParam), &pointerType)
+                || ((pointerType != PT_TOUCH) && (pointerType != PT_PEN)))
+            {
+                break;
+            }
+
+            point.x = GET_X_LPARAM(LParam);
+            point.y = GET_Y_LPARAM(LParam);
+            ScreenToClient(Window, &point);
+            deltaY = point.y - gPickerState.StartPoint.y;
+            if (!gPickerState.Dragging && (abs(deltaY) >= PICKER_DRAG_THRESHOLD))
+            {
+                gPickerState.Dragging = TRUE;
+            }
+
+            if (gPickerState.Dragging)
+            {
+                gPickerState.TopIndex = ClampInt(
+                    gPickerState.StartTopIndex + ((gPickerState.StartPoint.y - point.y) / max(PICKER_ITEM_HEIGHT / 2, 1)),
+                    0,
+                    GetPickerMaxTopIndex());
+                UpdatePickerScrollBar();
+                InvalidateRect(Window, nullptr, TRUE);
+            }
+            return 0;
+        }
+        break;
+
+    case WM_POINTERUP:
+        if (gPickerState.Tracking && (gPickerState.ContactId == GET_POINTERID_WPARAM(WParam)))
+        {
+            POINT point;
+            INT selectedIndex;
+            BOOL wasDragging;
+
+            point.x = GET_X_LPARAM(LParam);
+            point.y = GET_Y_LPARAM(LParam);
+            ScreenToClient(Window, &point);
+            wasDragging = gPickerState.Dragging;
+            ResetPickerTracking();
+            if (!wasDragging)
+            {
+                selectedIndex = PickerItemIndexFromPoint(point);
+                if (selectedIndex >= 0)
+                {
+                    SelectPickerItem(selectedIndex);
+                }
+            }
+            return 0;
+        }
+        break;
+
     case WM_LBUTTONDOWN:
+        if (IsTouchPromotedMouseMessage())
+        {
+            return 0;
+        }
+        
     {
         POINT point;
 
@@ -1015,6 +1110,11 @@ PickerPopupWndProc(
     }
 
     case WM_MOUSEMOVE:
+        if (IsTouchPromotedMouseMessage())
+        {
+            return 0;
+        }
+
         if (gPickerState.Tracking && (GetCapture() == Window))
         {
             POINT point;
@@ -1042,6 +1142,11 @@ PickerPopupWndProc(
         break;
 
     case WM_LBUTTONUP:
+        if (IsTouchPromotedMouseMessage())
+        {
+            return 0;
+        }
+
         if (gPickerState.Tracking && (GetCapture() == Window))
         {
             POINT point;
