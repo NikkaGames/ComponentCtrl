@@ -44,8 +44,10 @@
 #define UI_CONTROL_HEIGHT 32
 #define ID_ABOUT_AUTHOR_TEXT  50001
 #define ID_ABOUT_LINK_TEXT    50002
-#define COMBO_SWIPE_SUBCLASS_ID 1u
-#define COMBO_SWIPE_THRESHOLD 6
+#define PICKER_POPUP_CLASS_NAME L"ComponentCtrlPickerPopup"
+#define PICKER_ITEM_HEIGHT 36
+#define PICKER_MAX_VISIBLE_ITEMS 8
+#define PICKER_DRAG_THRESHOLD 6
 
 static const COLORREF kColorWindowBackground = RGB(242, 245, 248);
 static const COLORREF kColorCardBackground = RGB(255, 255, 255);
@@ -53,6 +55,8 @@ static const COLORREF kColorCardBorder = RGB(225, 231, 238);
 static const COLORREF kColorTextPrimary = RGB(26, 32, 44);
 static const COLORREF kColorTextMuted = RGB(96, 108, 128);
 static const COLORREF kColorTextAccent = RGB(17, 94, 89);
+static const COLORREF kColorPickerSelection = RGB(225, 239, 255);
+static const COLORREF kColorPickerHover = RGB(242, 247, 253);
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -84,29 +88,61 @@ struct APP_STATE {
     int ClientHeight;
     BOOL LedAvailable;
     AW22XXX_DEVICE_INFORMATION LedInformation;
+    ULONG SelectedConfigId;
+    ULONG SelectedTouchRateLevel;
     std::vector<AW22XXX_CONFIG_DESCRIPTOR> Configs;
 };
 
 static APP_STATE gAppState = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
 
-typedef struct _DROPDOWN_SWIPE_STATE {
-    HWND ListWindow;
+enum PICKER_KIND {
+    PickerKindNone = 0,
+    PickerKindConfig,
+    PickerKindTouchRate
+};
+
+typedef struct _PICKER_ITEM {
+    std::wstring Label;
+    ULONG Value;
+} PICKER_ITEM, *PPICKER_ITEM;
+
+typedef struct _PICKER_STATE {
+    HWND Window;
+    HWND OwnerControl;
+    PICKER_KIND Kind;
+    std::vector<PICKER_ITEM> Items;
+    INT SelectedIndex;
+    INT TopIndex;
     BOOL Tracking;
     BOOL Dragging;
     DWORD ContactId;
     POINT StartPoint;
     INT StartTopIndex;
-} DROPDOWN_SWIPE_STATE, *PDROPDOWN_SWIPE_STATE;
+} PICKER_STATE, *PPICKER_STATE;
 
-static DROPDOWN_SWIPE_STATE gDropdownSwipeState = {};
+static PICKER_STATE gPickerState = {};
+
+typedef struct _TOUCH_RATE_OPTION {
+    ULONG Level;
+    PCWSTR Label;
+} TOUCH_RATE_OPTION, *PTOUCH_RATE_OPTION;
+
+static const TOUCH_RATE_OPTION gTouchRateOptions[] = {
+    { GOODIX_REPORT_RATE_120HZ, L"120 Hz" },
+    { GOODIX_REPORT_RATE_240HZ, L"240 Hz" },
+    { GOODIX_REPORT_RATE_480HZ, L"480 Hz" },
+    { GOODIX_REPORT_RATE_960HZ, L"960 Hz" },
+};
 
 ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK    PickerPopupWndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
 static BOOL         GetTouchDevicePath(_Out_ std::wstring& DevicePath);
 static BOOL         EnsureTouchDeviceOpen();
-static void         AttachSwipeScrollToCombo(_In_opt_ HWND ComboBox);
+static std::wstring FormatConfigDisplayName(_In_ const AW22XXX_CONFIG_DESCRIPTOR& Config);
+static PCWSTR       TouchReportRateLabel(_In_ ULONG ReportRateLevel);
 
 typedef struct _UI_LAYOUT {
     RECT HeaderTitleRect;
@@ -462,38 +498,572 @@ ScrollToPosition(
 }
 
 static void
-ResetDropdownSwipeState(
-    _In_opt_ HWND ListWindow
-    )
+ResetPickerTracking()
 {
-    if ((ListWindow != nullptr) && (GetCapture() == ListWindow))
+    if ((gPickerState.Window != nullptr) && (GetCapture() == gPickerState.Window))
     {
         ReleaseCapture();
     }
 
-    gDropdownSwipeState.ListWindow = nullptr;
-    gDropdownSwipeState.Tracking = FALSE;
-    gDropdownSwipeState.Dragging = FALSE;
-    gDropdownSwipeState.ContactId = 0;
-    gDropdownSwipeState.StartPoint.x = 0;
-    gDropdownSwipeState.StartPoint.y = 0;
-    gDropdownSwipeState.StartTopIndex = 0;
+    gPickerState.Tracking = FALSE;
+    gPickerState.Dragging = FALSE;
+    gPickerState.ContactId = 0;
+    gPickerState.StartPoint.x = 0;
+    gPickerState.StartPoint.y = 0;
+    gPickerState.StartTopIndex = 0;
 }
 
-static LRESULT CALLBACK
-ComboListSubclassProc(
+static INT
+FindConfigIndexById(
+    _In_ ULONG ConfigId
+    )
+{
+    size_t index;
+    INT visibleIndex;
+
+    visibleIndex = 0;
+    for (index = 0; index < gAppState.Configs.size(); index++)
+    {
+        const AW22XXX_CONFIG_DESCRIPTOR& config = gAppState.Configs[index];
+
+        if ((config.Flags & AW22XXX_CONFIG_FLAG_AVAILABLE) == 0u)
+        {
+            continue;
+        }
+
+        if (config.ConfigId == ConfigId)
+        {
+            return visibleIndex;
+        }
+
+        visibleIndex++;
+    }
+
+    return -1;
+}
+
+static INT
+FindTouchRateIndexByLevel(
+    _In_ ULONG Level
+    )
+{
+    INT index;
+
+    for (index = 0; index < ARRAYSIZE(gTouchRateOptions); index++)
+    {
+        if (gTouchRateOptions[index].Level == Level)
+        {
+            return index;
+        }
+    }
+
+    return -1;
+}
+
+static INT
+GetPickerVisibleCount()
+{
+    RECT clientRect;
+
+    if (gPickerState.Window == nullptr)
+    {
+        return 0;
+    }
+
+    GetClientRect(gPickerState.Window, &clientRect);
+    return max((clientRect.bottom - clientRect.top) / PICKER_ITEM_HEIGHT, 1);
+}
+
+static INT
+GetPickerMaxTopIndex()
+{
+    return max((INT)gPickerState.Items.size() - GetPickerVisibleCount(), 0);
+}
+
+static void
+UpdatePickerScrollBar()
+{
+    SCROLLINFO si;
+
+    if (gPickerState.Window == nullptr)
+    {
+        return;
+    }
+
+    gPickerState.TopIndex = ClampInt(gPickerState.TopIndex, 0, GetPickerMaxTopIndex());
+    ZeroMemory(&si, sizeof(si));
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = max((INT)gPickerState.Items.size() - 1, 0);
+    si.nPage = (UINT)GetPickerVisibleCount();
+    si.nPos = gPickerState.TopIndex;
+    SetScrollInfo(gPickerState.Window, SB_VERT, &si, TRUE);
+    ShowScrollBar(gPickerState.Window, SB_VERT, gPickerState.Items.size() > (size_t)GetPickerVisibleCount());
+}
+
+static std::wstring
+FormatPickerButtonCaption(
+    _In_ PCWSTR Text
+    )
+{
+    std::wstring caption;
+
+    caption.assign(Text != nullptr ? Text : L"");
+    caption.append(L"    v");
+    return caption;
+}
+
+static void
+UpdateConfigPickerText()
+{
+    size_t index;
+    std::wstring caption;
+
+    for (index = 0; index < gAppState.Configs.size(); index++)
+    {
+        const AW22XXX_CONFIG_DESCRIPTOR& config = gAppState.Configs[index];
+
+        if (((config.Flags & AW22XXX_CONFIG_FLAG_AVAILABLE) != 0u)
+            && (config.ConfigId == gAppState.SelectedConfigId))
+        {
+            caption = FormatPickerButtonCaption(FormatConfigDisplayName(config).c_str());
+            break;
+        }
+    }
+
+    if (caption.empty())
+    {
+        caption = FormatPickerButtonCaption(L"Select LED config");
+    }
+
+    if (gAppState.ConfigCombo != nullptr)
+    {
+        SetWindowTextW(gAppState.ConfigCombo, caption.c_str());
+    }
+}
+
+static void
+UpdateTouchPickerText()
+{
+    std::wstring caption;
+
+    caption = FormatPickerButtonCaption(TouchReportRateLabel(gAppState.SelectedTouchRateLevel));
+    if (gAppState.TouchRateCombo != nullptr)
+    {
+        SetWindowTextW(gAppState.TouchRateCombo, caption.c_str());
+    }
+}
+
+static void
+BuildPickerItems(
+    _In_ PICKER_KIND Kind
+    )
+{
+    size_t index;
+
+    gPickerState.Items.clear();
+    gPickerState.Kind = Kind;
+
+    if (Kind == PickerKindConfig)
+    {
+        for (index = 0; index < gAppState.Configs.size(); index++)
+        {
+            const AW22XXX_CONFIG_DESCRIPTOR& config = gAppState.Configs[index];
+            PICKER_ITEM item;
+
+            if ((config.Flags & AW22XXX_CONFIG_FLAG_AVAILABLE) == 0u)
+            {
+                continue;
+            }
+
+            item.Label = FormatConfigDisplayName(config);
+            item.Value = config.ConfigId;
+            gPickerState.Items.push_back(item);
+        }
+    }
+    else if (Kind == PickerKindTouchRate)
+    {
+        for (index = 0; index < ARRAYSIZE(gTouchRateOptions); index++)
+        {
+            PICKER_ITEM item;
+
+            item.Label = gTouchRateOptions[index].Label;
+            item.Value = gTouchRateOptions[index].Level;
+            gPickerState.Items.push_back(item);
+        }
+    }
+}
+
+static void
+ClosePickerPopup()
+{
+    HWND popupWindow;
+
+    popupWindow = gPickerState.Window;
+    ResetPickerTracking();
+    gPickerState.OwnerControl = nullptr;
+    gPickerState.Kind = PickerKindNone;
+    gPickerState.SelectedIndex = -1;
+    gPickerState.TopIndex = 0;
+    gPickerState.Items.clear();
+    gPickerState.Window = nullptr;
+
+    if ((popupWindow != nullptr) && IsWindow(popupWindow))
+    {
+        DestroyWindow(popupWindow);
+    }
+}
+
+static INT
+PickerItemIndexFromPoint(
+    _In_ POINT Point
+    )
+{
+    RECT clientRect;
+    INT index;
+
+    if (gPickerState.Window == nullptr)
+    {
+        return -1;
+    }
+
+    GetClientRect(gPickerState.Window, &clientRect);
+    if ((Point.x < 0) || (Point.y < 0) || (Point.x >= clientRect.right) || (Point.y >= clientRect.bottom))
+    {
+        return -1;
+    }
+
+    index = gPickerState.TopIndex + (Point.y / PICKER_ITEM_HEIGHT);
+    if ((index < 0) || (index >= (INT)gPickerState.Items.size()))
+    {
+        return -1;
+    }
+
+    return index;
+}
+
+static void
+SelectPickerItem(
+    _In_ INT Index
+    )
+{
+    if ((Index < 0) || (Index >= (INT)gPickerState.Items.size()))
+    {
+        return;
+    }
+
+    if (gPickerState.Kind == PickerKindConfig)
+    {
+        gAppState.SelectedConfigId = gPickerState.Items[(size_t)Index].Value;
+        UpdateConfigPickerText();
+    }
+    else if (gPickerState.Kind == PickerKindTouchRate)
+    {
+        gAppState.SelectedTouchRateLevel = gPickerState.Items[(size_t)Index].Value;
+        UpdateTouchPickerText();
+    }
+
+    ClosePickerPopup();
+}
+
+static void
+OpenPickerPopup(
+    _In_ PICKER_KIND Kind,
+    _In_ HWND OwnerControl
+    )
+{
+    RECT ownerRect;
+    RECT clientRect;
+    INT visibleCount;
+    INT popupWidth;
+    INT popupHeight;
+    INT popupX;
+    INT popupY;
+
+    if ((OwnerControl == nullptr) || (gAppState.MainWindow == nullptr))
+    {
+        return;
+    }
+
+    if ((gPickerState.Window != nullptr) && (gPickerState.OwnerControl == OwnerControl))
+    {
+        ClosePickerPopup();
+        return;
+    }
+
+    ClosePickerPopup();
+    BuildPickerItems(Kind);
+    if (gPickerState.Items.empty())
+    {
+        return;
+    }
+
+    gPickerState.OwnerControl = OwnerControl;
+    gPickerState.SelectedIndex = -1;
+    if (Kind == PickerKindConfig)
+    {
+        gPickerState.SelectedIndex = FindConfigIndexById(gAppState.SelectedConfigId);
+    }
+    else if (Kind == PickerKindTouchRate)
+    {
+        gPickerState.SelectedIndex = FindTouchRateIndexByLevel(gAppState.SelectedTouchRateLevel);
+    }
+
+    visibleCount = min((INT)gPickerState.Items.size(), PICKER_MAX_VISIBLE_ITEMS);
+    popupHeight = (visibleCount * PICKER_ITEM_HEIGHT) + 2;
+    GetWindowRect(OwnerControl, &ownerRect);
+    MapWindowPoints(nullptr, gAppState.MainWindow, (LPPOINT)&ownerRect, 2);
+    GetClientRect(gAppState.MainWindow, &clientRect);
+
+    popupWidth = max(ownerRect.right - ownerRect.left, 320);
+    popupX = ownerRect.left;
+    popupY = ownerRect.bottom + 4;
+    if ((popupX + popupWidth) > (clientRect.right - UI_MARGIN))
+    {
+        popupX = max(UI_MARGIN, clientRect.right - popupWidth - UI_MARGIN);
+    }
+    if ((popupY + popupHeight) > (clientRect.bottom - UI_MARGIN))
+    {
+        if ((ownerRect.top - 4 - popupHeight) >= UI_MARGIN)
+        {
+            popupY = ownerRect.top - 4 - popupHeight;
+        }
+        else
+        {
+            popupHeight = max((PICKER_ITEM_HEIGHT * 3) + 2, clientRect.bottom - popupY - UI_MARGIN);
+        }
+    }
+
+    gPickerState.TopIndex = ClampInt(
+        gPickerState.SelectedIndex >= 0 ? gPickerState.SelectedIndex : 0,
+        0,
+        max((INT)gPickerState.Items.size() - visibleCount, 0));
+
+    gPickerState.Window = CreateWindowExW(
+        0,
+        PICKER_POPUP_CLASS_NAME,
+        nullptr,
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL,
+        popupX,
+        popupY,
+        popupWidth,
+        popupHeight,
+        gAppState.MainWindow,
+        nullptr,
+        hInst,
+        nullptr);
+    if (gPickerState.Window == nullptr)
+    {
+        gPickerState.OwnerControl = nullptr;
+        gPickerState.Kind = PickerKindNone;
+        gPickerState.Items.clear();
+        return;
+    }
+
+    RegisterTouchWindow(gPickerState.Window, 0);
+    SetWindowPos(gPickerState.Window, HWND_TOP, popupX, popupY, popupWidth, popupHeight, SWP_SHOWWINDOW);
+    UpdatePickerScrollBar();
+    InvalidateRect(gPickerState.Window, nullptr, TRUE);
+}
+
+LRESULT CALLBACK
+PickerPopupWndProc(
     HWND Window,
     UINT Message,
     WPARAM WParam,
-    LPARAM LParam,
-    UINT_PTR SubclassId,
-    DWORD_PTR ReferenceData
+    LPARAM LParam
     )
 {
-    UNREFERENCED_PARAMETER(SubclassId);
-
     switch (Message)
     {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC dc;
+        RECT clientRect;
+        INT visibleCount;
+        INT index;
+        HFONT oldFont;
+        int oldBkMode;
+        COLORREF oldTextColor;
+
+        dc = BeginPaint(Window, &ps);
+        GetClientRect(Window, &clientRect);
+        FillRect(dc, &clientRect, gAppState.CardBrush);
+
+        oldFont = (HFONT)SelectObject(dc, gAppState.BodyFont);
+        oldBkMode = SetBkMode(dc, TRANSPARENT);
+        oldTextColor = SetTextColor(dc, kColorTextPrimary);
+
+        visibleCount = GetPickerVisibleCount();
+        for (index = 0; index < visibleCount; index++)
+        {
+            INT itemIndex;
+            RECT itemRect;
+            HBRUSH fillBrush;
+
+            itemIndex = gPickerState.TopIndex + index;
+            if (itemIndex >= (INT)gPickerState.Items.size())
+            {
+                break;
+            }
+
+            itemRect = MakeRect(
+                0,
+                index * PICKER_ITEM_HEIGHT,
+                clientRect.right,
+                (index + 1) * PICKER_ITEM_HEIGHT);
+            itemRect.right = clientRect.right - ((gPickerState.Items.size() > (size_t)visibleCount) ? GetSystemMetrics(SM_CXVSCROLL) : 0);
+
+            if (itemIndex == gPickerState.SelectedIndex)
+            {
+                fillBrush = CreateSolidBrush(kColorPickerSelection);
+            }
+            else
+            {
+                fillBrush = CreateSolidBrush(kColorCardBackground);
+            }
+
+            FillRect(dc, &itemRect, fillBrush);
+            DeleteObject(fillBrush);
+            itemRect.left += 12;
+            itemRect.right -= 12;
+            DrawTextW(dc, gPickerState.Items[(size_t)itemIndex].Label.c_str(), -1, &itemRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+
+        SetTextColor(dc, oldTextColor);
+        SetBkMode(dc, oldBkMode);
+        SelectObject(dc, oldFont);
+        EndPaint(Window, &ps);
+        return 0;
+    }
+
+    case WM_VSCROLL:
+    {
+        SCROLLINFO si;
+        INT newPos;
+
+        ZeroMemory(&si, sizeof(si));
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(Window, SB_VERT, &si);
+        newPos = gPickerState.TopIndex;
+
+        switch (LOWORD(WParam))
+        {
+        case SB_LINEUP:
+            newPos--;
+            break;
+        case SB_LINEDOWN:
+            newPos++;
+            break;
+        case SB_PAGEUP:
+            newPos -= GetPickerVisibleCount();
+            break;
+        case SB_PAGEDOWN:
+            newPos += GetPickerVisibleCount();
+            break;
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK:
+            newPos = si.nTrackPos;
+            break;
+        default:
+            return 0;
+        }
+
+        gPickerState.TopIndex = ClampInt(newPos, 0, GetPickerMaxTopIndex());
+        UpdatePickerScrollBar();
+        InvalidateRect(Window, nullptr, TRUE);
+        return 0;
+    }
+
+    case WM_MOUSEWHEEL:
+    {
+        short wheelDelta;
+
+        wheelDelta = GET_WHEEL_DELTA_WPARAM(WParam);
+        if (wheelDelta > 0)
+        {
+            gPickerState.TopIndex = ClampInt(gPickerState.TopIndex - 1, 0, GetPickerMaxTopIndex());
+        }
+        else if (wheelDelta < 0)
+        {
+            gPickerState.TopIndex = ClampInt(gPickerState.TopIndex + 1, 0, GetPickerMaxTopIndex());
+        }
+
+        UpdatePickerScrollBar();
+        InvalidateRect(Window, nullptr, TRUE);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN:
+    {
+        POINT point;
+
+        point.x = GET_X_LPARAM(LParam);
+        point.y = GET_Y_LPARAM(LParam);
+        gPickerState.Tracking = TRUE;
+        gPickerState.Dragging = FALSE;
+        gPickerState.StartPoint = point;
+        gPickerState.StartTopIndex = gPickerState.TopIndex;
+        SetCapture(Window);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE:
+        if (gPickerState.Tracking && (GetCapture() == Window))
+        {
+            POINT point;
+            INT deltaY;
+
+            point.x = GET_X_LPARAM(LParam);
+            point.y = GET_Y_LPARAM(LParam);
+            deltaY = point.y - gPickerState.StartPoint.y;
+            if (!gPickerState.Dragging && (abs(deltaY) >= PICKER_DRAG_THRESHOLD))
+            {
+                gPickerState.Dragging = TRUE;
+            }
+
+            if (gPickerState.Dragging)
+            {
+                gPickerState.TopIndex = ClampInt(
+                    gPickerState.StartTopIndex + ((gPickerState.StartPoint.y - point.y) / max(PICKER_ITEM_HEIGHT / 2, 1)),
+                    0,
+                    GetPickerMaxTopIndex());
+                UpdatePickerScrollBar();
+                InvalidateRect(Window, nullptr, TRUE);
+            }
+            return 0;
+        }
+        break;
+
+    case WM_LBUTTONUP:
+        if (gPickerState.Tracking && (GetCapture() == Window))
+        {
+            POINT point;
+            INT selectedIndex;
+            BOOL wasDragging;
+
+            point.x = GET_X_LPARAM(LParam);
+            point.y = GET_Y_LPARAM(LParam);
+            wasDragging = gPickerState.Dragging;
+            ResetPickerTracking();
+            if (!wasDragging)
+            {
+                selectedIndex = PickerItemIndexFromPoint(point);
+                if (selectedIndex >= 0)
+                {
+                    SelectPickerItem(selectedIndex);
+                }
+            }
+            return 0;
+        }
+        break;
+
     case WM_TOUCH:
     {
         UINT inputCount;
@@ -512,69 +1082,47 @@ ComboListSubclassProc(
         if (GetTouchInputInfo((HTOUCHINPUT)LParam, inputCount, touchInputs, sizeof(TOUCHINPUT)))
         {
             UINT index;
-            HWND comboBox;
 
-            comboBox = (HWND)ReferenceData;
             for (index = 0; index < inputCount; index++)
             {
                 TOUCHINPUT* touch;
                 POINT point;
-                RECT clientRect;
 
                 touch = &touchInputs[index];
                 point.x = TOUCH_COORD_TO_PIXEL(touch->x);
                 point.y = TOUCH_COORD_TO_PIXEL(touch->y);
                 ScreenToClient(Window, &point);
-                GetClientRect(Window, &clientRect);
 
                 if ((touch->dwFlags & TOUCHEVENTF_DOWN) != 0)
                 {
-                    if (point.x >= (clientRect.right - GetSystemMetrics(SM_CXVSCROLL)))
-                    {
-                        continue;
-                    }
-
-                    gDropdownSwipeState.ListWindow = Window;
-                    gDropdownSwipeState.Tracking = TRUE;
-                    gDropdownSwipeState.Dragging = FALSE;
-                    gDropdownSwipeState.ContactId = touch->dwID;
-                    gDropdownSwipeState.StartPoint = point;
-                    gDropdownSwipeState.StartTopIndex = (INT)SendMessageW(Window, LB_GETTOPINDEX, 0, 0);
+                    gPickerState.Tracking = TRUE;
+                    gPickerState.Dragging = FALSE;
+                    gPickerState.ContactId = touch->dwID;
+                    gPickerState.StartPoint = point;
+                    gPickerState.StartTopIndex = gPickerState.TopIndex;
                     SetCapture(Window);
                     handled = TRUE;
                 }
                 else if ((touch->dwFlags & TOUCHEVENTF_MOVE) != 0)
                 {
-                    if (gDropdownSwipeState.Tracking
-                        && (gDropdownSwipeState.ListWindow == Window)
-                        && (gDropdownSwipeState.ContactId == touch->dwID)
-                        && (GetCapture() == Window))
+                    if (gPickerState.Tracking && (gPickerState.ContactId == touch->dwID))
                     {
                         INT deltaY;
 
-                        deltaY = point.y - gDropdownSwipeState.StartPoint.y;
-                        if (!gDropdownSwipeState.Dragging && (abs(deltaY) >= COMBO_SWIPE_THRESHOLD))
+                        deltaY = point.y - gPickerState.StartPoint.y;
+                        if (!gPickerState.Dragging && (abs(deltaY) >= PICKER_DRAG_THRESHOLD))
                         {
-                            gDropdownSwipeState.Dragging = TRUE;
+                            gPickerState.Dragging = TRUE;
                         }
 
-                        if (gDropdownSwipeState.Dragging)
+                        if (gPickerState.Dragging)
                         {
-                            INT itemHeight;
-                            INT count;
-                            INT scrollUnits;
-                            INT topIndex;
-
-                            itemHeight = (INT)SendMessageW(Window, LB_GETITEMHEIGHT, 0, 0);
-                            if (itemHeight <= 0)
-                            {
-                                itemHeight = 16;
-                            }
-
-                            count = (INT)SendMessageW(Window, LB_GETCOUNT, 0, 0);
-                            scrollUnits = (gDropdownSwipeState.StartPoint.y - point.y) / max(itemHeight / 2, 1);
-                            topIndex = ClampInt(gDropdownSwipeState.StartTopIndex + scrollUnits, 0, max(count - 1, 0));
-                            SendMessageW(Window, LB_SETTOPINDEX, (WPARAM)topIndex, 0);
+                            gPickerState.TopIndex = ClampInt(
+                                gPickerState.StartTopIndex + ((gPickerState.StartPoint.y - point.y) / max(PICKER_ITEM_HEIGHT / 2, 1)),
+                                0,
+                                GetPickerMaxTopIndex());
+                            UpdatePickerScrollBar();
+                            InvalidateRect(Window, nullptr, TRUE);
                         }
 
                         handled = TRUE;
@@ -582,29 +1130,20 @@ ComboListSubclassProc(
                 }
                 else if ((touch->dwFlags & TOUCHEVENTF_UP) != 0)
                 {
-                    if (gDropdownSwipeState.Tracking
-                        && (gDropdownSwipeState.ListWindow == Window)
-                        && (gDropdownSwipeState.ContactId == touch->dwID))
+                    if (gPickerState.Tracking && (gPickerState.ContactId == touch->dwID))
                     {
                         BOOL wasDragging;
 
-                        wasDragging = gDropdownSwipeState.Dragging;
-                        ResetDropdownSwipeState(Window);
-                        if (!wasDragging && (comboBox != nullptr))
+                        wasDragging = gPickerState.Dragging;
+                        ResetPickerTracking();
+                        if (!wasDragging)
                         {
-                            LRESULT itemFromPoint;
-                            INT itemIndex;
+                            INT selectedIndex;
 
-                            itemFromPoint = SendMessageW(
-                                Window,
-                                LB_ITEMFROMPOINT,
-                                0,
-                                MAKELPARAM(point.x, point.y));
-                            itemIndex = LOWORD(itemFromPoint);
-                            if ((HIWORD(itemFromPoint) == 0) && (itemIndex >= 0))
+                            selectedIndex = PickerItemIndexFromPoint(point);
+                            if (selectedIndex >= 0)
                             {
-                                SendMessageW(comboBox, CB_SETCURSEL, (WPARAM)itemIndex, 0);
-                                SendMessageW(comboBox, CB_SHOWDROPDOWN, FALSE, 0);
+                                SelectPickerItem(selectedIndex);
                             }
                         }
 
@@ -623,216 +1162,16 @@ ComboListSubclassProc(
         break;
     }
 
-    case WM_POINTERDOWN:
-    {
-        POINTER_INPUT_TYPE pointerType;
-        RECT clientRect;
-        POINT point;
-        UINT pointerId;
-
-        pointerId = GET_POINTERID_WPARAM(WParam);
-        if (!GetPointerType(pointerId, &pointerType) || (pointerType != PT_TOUCH))
-        {
-            break;
-        }
-
-        point.x = GET_X_LPARAM(LParam);
-        point.y = GET_Y_LPARAM(LParam);
-        ScreenToClient(Window, &point);
-        GetClientRect(Window, &clientRect);
-        if (point.x >= (clientRect.right - GetSystemMetrics(SM_CXVSCROLL)))
-        {
-            break;
-        }
-
-        gDropdownSwipeState.ListWindow = Window;
-        gDropdownSwipeState.Tracking = TRUE;
-        gDropdownSwipeState.Dragging = FALSE;
-        gDropdownSwipeState.ContactId = pointerId;
-        gDropdownSwipeState.StartPoint = point;
-        gDropdownSwipeState.StartTopIndex = (INT)SendMessageW(Window, LB_GETTOPINDEX, 0, 0);
-        SetCapture(Window);
-        return 0;
-    }
-
-    case WM_POINTERUPDATE:
-        if (gDropdownSwipeState.Tracking
-            && (gDropdownSwipeState.ListWindow == Window)
-            && (gDropdownSwipeState.ContactId == GET_POINTERID_WPARAM(WParam))
-            && (GetCapture() == Window))
-        {
-            POINT point;
-            INT deltaY;
-
-            point.x = GET_X_LPARAM(LParam);
-            point.y = GET_Y_LPARAM(LParam);
-            ScreenToClient(Window, &point);
-            deltaY = point.y - gDropdownSwipeState.StartPoint.y;
-
-            if (!gDropdownSwipeState.Dragging && (abs(deltaY) >= COMBO_SWIPE_THRESHOLD))
-            {
-                gDropdownSwipeState.Dragging = TRUE;
-            }
-
-            if (gDropdownSwipeState.Dragging)
-            {
-                INT itemHeight;
-                INT count;
-                INT scrollUnits;
-                INT topIndex;
-
-                itemHeight = (INT)SendMessageW(Window, LB_GETITEMHEIGHT, 0, 0);
-                if (itemHeight <= 0)
-                {
-                    itemHeight = 16;
-                }
-
-                count = (INT)SendMessageW(Window, LB_GETCOUNT, 0, 0);
-                scrollUnits = (gDropdownSwipeState.StartPoint.y - point.y) / max(itemHeight / 2, 1);
-                topIndex = ClampInt(gDropdownSwipeState.StartTopIndex + scrollUnits, 0, max(count - 1, 0));
-                SendMessageW(Window, LB_SETTOPINDEX, (WPARAM)topIndex, 0);
-                return 0;
-            }
-
-            return 0;
-        }
-        break;
-
-    case WM_POINTERUP:
-        if (gDropdownSwipeState.Tracking
-            && (gDropdownSwipeState.ListWindow == Window)
-            && (gDropdownSwipeState.ContactId == GET_POINTERID_WPARAM(WParam)))
-        {
-            HWND comboBox;
-            BOOL wasDragging = gDropdownSwipeState.Dragging;
-            POINT point;
-
-            comboBox = (HWND)ReferenceData;
-            point.x = GET_X_LPARAM(LParam);
-            point.y = GET_Y_LPARAM(LParam);
-            ScreenToClient(Window, &point);
-            ResetDropdownSwipeState(Window);
-            if (wasDragging)
-            {
-                return 0;
-            }
-
-            if (comboBox != nullptr)
-            {
-                LRESULT itemFromPoint;
-                INT itemIndex;
-
-                itemFromPoint = SendMessageW(
-                    Window,
-                    LB_ITEMFROMPOINT,
-                    0,
-                    MAKELPARAM(point.x, point.y));
-                itemIndex = LOWORD(itemFromPoint);
-                if ((HIWORD(itemFromPoint) == 0) && (itemIndex >= 0))
-                {
-                    SendMessageW(comboBox, CB_SETCURSEL, (WPARAM)itemIndex, 0);
-                    SendMessageW(comboBox, CB_SHOWDROPDOWN, FALSE, 0);
-                    return 0;
-                }
-            }
-
-            return 0;
-        }
-        break;
-
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONUP:
-    case WM_MOUSEMOVE:
-        if (gDropdownSwipeState.Tracking && (gDropdownSwipeState.ListWindow == Window))
-        {
-            return 0;
-        }
-        break;
-
     case WM_CAPTURECHANGED:
-        if (gDropdownSwipeState.ListWindow == Window)
-        {
-            ResetDropdownSwipeState(nullptr);
-        }
-        break;
+        ResetPickerTracking();
+        return 0;
 
-    case WM_MOUSEWHEEL:
-    {
-        short wheelDelta;
-        INT itemHeight;
-        INT count;
-        INT topIndex;
-        INT deltaItems;
-
-        wheelDelta = GET_WHEEL_DELTA_WPARAM(WParam);
-        if (wheelDelta == 0)
-        {
-            break;
-        }
-
-        itemHeight = (INT)SendMessageW(Window, LB_GETITEMHEIGHT, 0, 0);
-        if (itemHeight <= 0)
-        {
-            itemHeight = 16;
-        }
-
-        count = (INT)SendMessageW(Window, LB_GETCOUNT, 0, 0);
-        topIndex = (INT)SendMessageW(Window, LB_GETTOPINDEX, 0, 0);
-        deltaItems = max(abs(wheelDelta) / WHEEL_DELTA, 1);
-        if (wheelDelta > 0)
-        {
-            topIndex -= deltaItems;
-        }
-        else
-        {
-            topIndex += deltaItems;
-        }
-
-        topIndex = ClampInt(topIndex, 0, max(count - 1, 0));
-        SendMessageW(Window, LB_SETTOPINDEX, (WPARAM)topIndex, 0);
+    case WM_DESTROY:
+        ResetPickerTracking();
         return 0;
     }
 
-    case WM_NCDESTROY:
-        if (gDropdownSwipeState.ListWindow == Window)
-        {
-            ResetDropdownSwipeState(nullptr);
-        }
-        RemoveWindowSubclass(Window, ComboListSubclassProc, COMBO_SWIPE_SUBCLASS_ID);
-        break;
-    }
-
-    return DefSubclassProc(Window, Message, WParam, LParam);
-}
-
-static void
-AttachSwipeScrollToCombo(
-    _In_opt_ HWND ComboBox
-    )
-{
-    COMBOBOXINFO comboInfo;
-
-    if (ComboBox == nullptr)
-    {
-        return;
-    }
-
-    ZeroMemory(&comboInfo, sizeof(comboInfo));
-    comboInfo.cbSize = sizeof(comboInfo);
-    if (!GetComboBoxInfo(ComboBox, &comboInfo))
-    {
-        return;
-    }
-
-    if (comboInfo.hwndList != nullptr)
-    {
-        RegisterTouchWindow(comboInfo.hwndList, 0);
-        SetWindowSubclass(
-            comboInfo.hwndList,
-            ComboListSubclassProc,
-            COMBO_SWIPE_SUBCLASS_ID,
-            (DWORD_PTR)ComboBox);
-    }
+    return DefWindowProcW(Window, Message, WParam, LParam);
 }
 
 static void
@@ -1457,44 +1796,27 @@ PopulateTouchRateCombo(
     _In_ ULONG SelectedLevel
     )
 {
-    struct TOUCH_RATE_OPTION {
-        ULONG Level;
-        PCWSTR Label;
-    };
-    static const TOUCH_RATE_OPTION kOptions[] = {
-        { GOODIX_REPORT_RATE_120HZ, L"120 Hz" },
-        { GOODIX_REPORT_RATE_240HZ, L"240 Hz" },
-        { GOODIX_REPORT_RATE_480HZ, L"480 Hz" },
-        { GOODIX_REPORT_RATE_960HZ, L"960 Hz" },
-    };
     INT selectedIndex = -1;
+    INT defaultIndex;
 
-    SendMessageW(gAppState.TouchRateCombo, CB_RESETCONTENT, 0, 0);
-    for (INT i = 0; i < ARRAYSIZE(kOptions); i++)
+    selectedIndex = FindTouchRateIndexByLevel(SelectedLevel);
+    defaultIndex = FindTouchRateIndexByLevel(GOODIX_REPORT_RATE_240HZ);
+    if (selectedIndex < 0)
     {
-        INT comboIndex = (INT)SendMessageW(gAppState.TouchRateCombo, CB_ADDSTRING, 0, (LPARAM)kOptions[i].Label);
-        if (comboIndex < 0)
-        {
-            continue;
-        }
-
-        SendMessageW(gAppState.TouchRateCombo, CB_SETITEMDATA, (WPARAM)comboIndex, (LPARAM)kOptions[i].Level);
-        if (kOptions[i].Level == SelectedLevel)
-        {
-            selectedIndex = comboIndex;
-        }
+        selectedIndex = (defaultIndex >= 0) ? defaultIndex : 0;
     }
 
-    if ((selectedIndex < 0) && (SendMessageW(gAppState.TouchRateCombo, CB_GETCOUNT, 0, 0) > 0))
+    if ((selectedIndex >= 0) && (selectedIndex < ARRAYSIZE(gTouchRateOptions)))
     {
-        selectedIndex = 1;
+        gAppState.SelectedTouchRateLevel = gTouchRateOptions[selectedIndex].Level;
+    }
+    else
+    {
+        gAppState.SelectedTouchRateLevel = GOODIX_REPORT_RATE_240HZ;
+        selectedIndex = defaultIndex;
     }
 
-    if (selectedIndex >= 0)
-    {
-        SendMessageW(gAppState.TouchRateCombo, CB_SETCURSEL, (WPARAM)selectedIndex, 0);
-    }
-
+    UpdateTouchPickerText();
     return selectedIndex;
 }
 
@@ -1675,46 +1997,51 @@ PopulateConfigCombo(
     size_t index;
     INT selectedIndex;
     INT availableCount;
+    ULONG firstAvailableConfigId;
 
-    SendMessageW(gAppState.ConfigCombo, CB_RESETCONTENT, 0, 0);
     selectedIndex = -1;
     availableCount = 0;
+    firstAvailableConfigId = 0;
 
     for (index = 0; index < gAppState.Configs.size(); index++)
     {
         const AW22XXX_CONFIG_DESCRIPTOR& config = gAppState.Configs[index];
-        std::wstring displayName;
-        INT comboIndex;
 
         if ((config.Flags & AW22XXX_CONFIG_FLAG_AVAILABLE) == 0u)
         {
             continue;
         }
 
-        displayName = FormatConfigDisplayName(config);
-        comboIndex = (INT)SendMessageW(gAppState.ConfigCombo, CB_ADDSTRING, 0, (LPARAM)displayName.c_str());
-        if (comboIndex < 0)
+        if (availableCount == 0)
         {
-            continue;
+            firstAvailableConfigId = config.ConfigId;
         }
 
         availableCount++;
-        SendMessageW(gAppState.ConfigCombo, CB_SETITEMDATA, (WPARAM)comboIndex, (LPARAM)config.ConfigId);
         if (config.ConfigId == SelectedConfigId)
         {
-            selectedIndex = comboIndex;
+            selectedIndex = availableCount - 1;
         }
     }
 
-    if ((selectedIndex < 0) && (SendMessageW(gAppState.ConfigCombo, CB_GETCOUNT, 0, 0) > 0))
+    if (availableCount > 0)
     {
-        selectedIndex = 0;
+        if (selectedIndex >= 0)
+        {
+            gAppState.SelectedConfigId = SelectedConfigId;
+        }
+        else
+        {
+            gAppState.SelectedConfigId = firstAvailableConfigId;
+            selectedIndex = 0;
+        }
     }
-    if (selectedIndex >= 0)
+    else
     {
-        SendMessageW(gAppState.ConfigCombo, CB_SETCURSEL, (WPARAM)selectedIndex, 0);
+        gAppState.SelectedConfigId = 0;
     }
 
+    UpdateConfigPickerText();
     return availableCount;
 }
 
@@ -1826,25 +2153,15 @@ static void
 ApplySelectedConfig()
 {
     AW22XXX_CONFIG_REQUEST request;
-    LRESULT selectedIndex;
-    LRESULT configId;
 
-    selectedIndex = SendMessageW(gAppState.ConfigCombo, CB_GETCURSEL, 0, 0);
-    if (selectedIndex == CB_ERR)
+    if (FindConfigIndexById(gAppState.SelectedConfigId) < 0)
     {
         SetStatusText(L"No config selected.");
         return;
     }
 
-    configId = SendMessageW(gAppState.ConfigCombo, CB_GETITEMDATA, (WPARAM)selectedIndex, 0);
-    if (configId == CB_ERR)
-    {
-        SetStatusText(L"Selected config has no id.");
-        return;
-    }
-
     ZeroMemory(&request, sizeof(request));
-    request.ConfigId = (ULONG)configId;
+    request.ConfigId = gAppState.SelectedConfigId;
     request.UseRgbOverride =
         (SendMessageW(gAppState.RgbCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1u : 0u;
 
@@ -1903,29 +2220,18 @@ ToggleFanLight()
 static void
 ApplySelectedTouchRate()
 {
-    LRESULT selectedIndex;
-    LRESULT reportRateLevel;
-
-    selectedIndex = SendMessageW(gAppState.TouchRateCombo, CB_GETCURSEL, 0, 0);
-    if (selectedIndex == CB_ERR)
+    if (FindTouchRateIndexByLevel(gAppState.SelectedTouchRateLevel) < 0)
     {
         SetStatusText(L"No touch report rate selected.");
         return;
     }
 
-    reportRateLevel = SendMessageW(gAppState.TouchRateCombo, CB_GETITEMDATA, (WPARAM)selectedIndex, 0);
-    if (reportRateLevel == CB_ERR)
-    {
-        SetStatusText(L"Selected touch report rate is invalid.");
-        return;
-    }
-
-    if (!ApplyTouchReportRate((ULONG)reportRateLevel))
+    if (!ApplyTouchReportRate(gAppState.SelectedTouchRateLevel))
     {
         return;
     }
 
-    SetStatusText(L"Applied touch report rate %ls.", TouchReportRateLabel((ULONG)reportRateLevel));
+    SetStatusText(L"Applied touch report rate %ls.", TouchReportRateLabel(gAppState.SelectedTouchRateLevel));
     RefreshUi();
 }
 
@@ -1936,13 +2242,13 @@ CreateMainControls(
 {
     gAppState.ConfigCombo = CreateWindowExW(
         0,
-        L"COMBOBOX",
-        nullptr,
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST,
+        L"BUTTON",
+        L"Select LED config    v",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         42,
         138,
         458,
-        260,
+        32,
         Window,
         (HMENU)IDC_CONFIG_COMBO,
         hInst,
@@ -2034,13 +2340,13 @@ CreateMainControls(
 
     gAppState.TouchRateCombo = CreateWindowExW(
         0,
-        L"COMBOBOX",
-        nullptr,
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWNLIST,
+        L"BUTTON",
+        L"240 Hz    v",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
         42,
         398,
         220,
-        200,
+        32,
         Window,
         (HMENU)IDC_TOUCH_RATE_COMBO,
         hInst,
@@ -2099,8 +2405,6 @@ CreateMainControls(
     ApplyFont(gAppState.TouchApplyButton, gAppState.BodyFont);
     ApplyFont(gAppState.TouchInfoText, gAppState.SmallFont);
     ApplyFont(gAppState.StatusText, gAppState.SmallFont);
-    AttachSwipeScrollToCombo(gAppState.ConfigCombo);
-    AttachSwipeScrollToCombo(gAppState.TouchRateCombo);
 }
 
 int APIENTRY
@@ -2148,6 +2452,8 @@ MyRegisterClass(
     )
 {
     WNDCLASSEXW wcex;
+    WNDCLASSEXW pickerClass;
+    ATOM mainClassAtom;
 
     ZeroMemory(&wcex, sizeof(wcex));
     wcex.cbSize = sizeof(wcex);
@@ -2161,7 +2467,26 @@ MyRegisterClass(
     wcex.lpszClassName = szWindowClass;
     wcex.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_SMALL));
 
-    return RegisterClassExW(&wcex);
+    mainClassAtom = RegisterClassExW(&wcex);
+    if (mainClassAtom == 0)
+    {
+        return 0;
+    }
+
+    ZeroMemory(&pickerClass, sizeof(pickerClass));
+    pickerClass.cbSize = sizeof(pickerClass);
+    pickerClass.style = CS_HREDRAW | CS_VREDRAW;
+    pickerClass.lpfnWndProc = PickerPopupWndProc;
+    pickerClass.hInstance = hInstance;
+    pickerClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    pickerClass.hbrBackground = nullptr;
+    pickerClass.lpszClassName = PICKER_POPUP_CLASS_NAME;
+    if ((RegisterClassExW(&pickerClass) == 0) && (GetLastError() != ERROR_CLASS_ALREADY_EXISTS))
+    {
+        return 0;
+    }
+
+    return mainClassAtom;
 }
 
 BOOL
@@ -2237,10 +2562,12 @@ WndProc(
     }
 
     case WM_SIZE:
+        ClosePickerPopup();
         ApplyLayout(hWnd, TRUE);
         return 0;
 
     case WM_VSCROLL:
+        ClosePickerPopup();
     {
         SCROLLINFO si;
         int newPos;
@@ -2284,6 +2611,7 @@ WndProc(
     }
 
     case WM_MOUSEWHEEL:
+        ClosePickerPopup();
     {
         short wheelDelta;
 
@@ -2342,54 +2670,62 @@ WndProc(
         switch (LOWORD(wParam))
         {
         case IDC_CONFIG_COMBO:
-            if (HIWORD(wParam) == CBN_DROPDOWN)
+            if (HIWORD(wParam) == BN_CLICKED)
             {
-                AttachSwipeScrollToCombo((HWND)lParam);
+                OpenPickerPopup(PickerKindConfig, gAppState.ConfigCombo);
                 return 0;
             }
             break;
 
         case IDC_TOUCH_RATE_COMBO:
-            if (HIWORD(wParam) == CBN_DROPDOWN)
+            if (HIWORD(wParam) == BN_CLICKED)
             {
-                AttachSwipeScrollToCombo((HWND)lParam);
+                OpenPickerPopup(PickerKindTouchRate, gAppState.TouchRateCombo);
                 return 0;
             }
             break;
 
         case IDC_APPLY_BUTTON:
+            ClosePickerPopup();
             ApplySelectedConfig();
             return 0;
 
         case IDC_REFRESH_BUTTON:
+            ClosePickerPopup();
             CloseDeviceHandle();
             CloseTouchDeviceHandle();
             RefreshUi();
             return 0;
 
         case IDC_FAN_TOGGLE_BUTTON:
+            ClosePickerPopup();
             ToggleFanLight();
             return 0;
 
         case IDC_OFF_BUTTON:
+            ClosePickerPopup();
             TurnLedsOff();
             return 0;
 
         case IDC_TOUCH_APPLY_BUTTON:
+            ClosePickerPopup();
             ApplySelectedTouchRate();
             return 0;
 
         case IDM_ABOUT:
+            ClosePickerPopup();
             DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
             return 0;
 
         case IDM_EXIT:
+            ClosePickerPopup();
             DestroyWindow(hWnd);
             return 0;
         }
         break;
 
     case WM_DESTROY:
+        ClosePickerPopup();
         CloseDeviceHandle();
         CloseTouchDeviceHandle();
         DestroyUiResources();
