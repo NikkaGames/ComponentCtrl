@@ -23,6 +23,7 @@
 #define IDC_TOUCH_RATE_COMBO             1007
 #define IDC_TOUCH_APPLY_BUTTON           1008
 #define IDC_TOUCH_INFO_TEXT              1009
+#define IDC_FAN_TOGGLE_BUTTON            1010
 #ifndef IDC_STATIC
 #define IDC_STATIC				-1
 #endif
@@ -34,7 +35,7 @@
 #define _APS_NO_MFC					130
 #define _APS_NEXT_RESOURCE_VALUE	129
 #define _APS_NEXT_COMMAND_VALUE		32771
-#define _APS_NEXT_CONTROL_VALUE		1010
+#define _APS_NEXT_CONTROL_VALUE		1011
 #define _APS_NEXT_SYMED_VALUE		110
 #endif
 #endif

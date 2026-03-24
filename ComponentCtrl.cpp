@@ -58,6 +58,7 @@ struct APP_STATE {
     HWND ConfigCombo;
     HWND ApplyButton;
     HWND RefreshButton;
+    HWND FanToggleButton;
     HWND OffButton;
     HWND RgbCheck;
     HWND InfoText;
@@ -74,6 +75,8 @@ struct APP_STATE {
     int ScrollY;
     int ClientWidth;
     int ClientHeight;
+    BOOL LedAvailable;
+    AW22XXX_DEVICE_INFORMATION LedInformation;
     std::vector<AW22XXX_CONFIG_DESCRIPTOR> Configs;
 };
 
@@ -95,6 +98,7 @@ typedef struct _UI_LAYOUT {
     RECT ConfigComboRect;
     RECT ApplyButtonRect;
     RECT RefreshButtonRect;
+    RECT FanToggleButtonRect;
     RECT OffButtonRect;
     RECT RgbCheckRect;
     RECT InfoTextRect;
@@ -291,15 +295,20 @@ ComputeUiLayout(
         Layout->LedCardRect.top + 100,
         ledInnerRight,
         Layout->LedCardRect.top + 100 + UI_CONTROL_HEIGHT);
-    Layout->OffButtonRect = MakeRect(
+    Layout->FanToggleButtonRect = MakeRect(
         ledActionLeft,
         Layout->LedCardRect.top + 140,
         ledInnerRight,
         Layout->LedCardRect.top + 140 + UI_CONTROL_HEIGHT);
+    Layout->OffButtonRect = MakeRect(
+        ledActionLeft,
+        Layout->LedCardRect.top + 180,
+        ledInnerRight,
+        Layout->LedCardRect.top + 180 + UI_CONTROL_HEIGHT);
     Layout->InfoTextRect = MakeRect(
         ledInnerLeft,
-        Layout->LedCardRect.top + 192,
-        ledInnerRight,
+        Layout->LedCardRect.top + 140,
+        ledMainRight,
         Layout->LedCardRect.bottom - 22);
 
     touchInnerLeft = Layout->TouchCardRect.left + 22;
@@ -391,6 +400,7 @@ ApplyLayout(
     MoveChildControl(gAppState.ConfigCombo, layout.ConfigComboRect);
     MoveChildControl(gAppState.ApplyButton, layout.ApplyButtonRect);
     MoveChildControl(gAppState.RefreshButton, layout.RefreshButtonRect);
+    MoveChildControl(gAppState.FanToggleButton, layout.FanToggleButtonRect);
     MoveChildControl(gAppState.OffButton, layout.OffButtonRect);
     MoveChildControl(gAppState.RgbCheck, layout.RgbCheckRect);
     MoveChildControl(gAppState.InfoText, layout.InfoTextRect);
@@ -580,6 +590,40 @@ FormatConfigDisplayName(
     return std::wstring(buffer);
 }
 
+static BOOL
+FindConfigIdByName(
+    _In_z_ PCSTR Name,
+    _Out_ PULONG ConfigId
+    )
+{
+    size_t index;
+
+    if ((Name == nullptr) || (ConfigId == nullptr))
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    for (index = 0; index < gAppState.Configs.size(); index++)
+    {
+        const AW22XXX_CONFIG_DESCRIPTOR& config = gAppState.Configs[index];
+
+        if ((config.Flags & AW22XXX_CONFIG_FLAG_AVAILABLE) == 0u)
+        {
+            continue;
+        }
+
+        if (lstrcmpiA(config.Name, Name) == 0)
+        {
+            *ConfigId = config.ConfigId;
+            return TRUE;
+        }
+    }
+
+    SetLastError(ERROR_NOT_FOUND);
+    return FALSE;
+}
+
 static PCWSTR
 TouchReportRateLabel(
     _In_ ULONG ReportRateLevel
@@ -656,6 +700,14 @@ FormatAw22ChipStatus(
     return std::wstring(buffer);
 }
 
+static PCWSTR
+Aw22FanStateLabel(
+    _In_ UCHAR Effect
+    )
+{
+    return (Effect == AW22XXX_EFFECT_FAN_LED_ON) ? L"On" : L"Off";
+}
+
 static void
 SetStatusText(
     _In_z_ _Printf_format_string_ PCWSTR Format,
@@ -714,6 +766,10 @@ EnableInteractiveControls(
     if (gAppState.RefreshButton != nullptr)
     {
         EnableWindow(gAppState.RefreshButton, TRUE);
+    }
+    if (gAppState.FanToggleButton != nullptr)
+    {
+        EnableWindow(gAppState.FanToggleButton, EnableDeviceActions);
     }
     if (gAppState.OffButton != nullptr)
     {
@@ -1180,6 +1236,33 @@ FetchDeviceInformation(
 }
 
 static BOOL
+ApplyAw22ConfigById(
+    _In_ ULONG ConfigId,
+    _In_ BOOLEAN UseRgbOverride
+    )
+{
+    AW22XXX_CONFIG_REQUEST request;
+
+    ZeroMemory(&request, sizeof(request));
+    request.ConfigId = ConfigId;
+    request.UseRgbOverride = UseRgbOverride ? 1u : 0u;
+    return SendIoctl(IOCTL_AW22XXX_APPLY_CONFIG, &request, sizeof(request), nullptr, 0, nullptr);
+}
+
+static BOOL
+ApplyAw22Effect(
+    _In_ UCHAR Effect
+    )
+{
+    AW22XXX_EFFECT_REQUEST request;
+
+    ZeroMemory(&request, sizeof(request));
+    request.Effect = Effect;
+    request.UseRgbOverride = 0u;
+    return SendIoctl(IOCTL_AW22XXX_APPLY_EFFECT, &request, sizeof(request), nullptr, 0, nullptr);
+}
+
+static BOOL
 FetchConfigTable(
     _Out_ std::vector<AW22XXX_CONFIG_DESCRIPTOR>& Configs
     )
@@ -1292,16 +1375,25 @@ RefreshUi()
     {
         std::wstring chipStatus;
 
+        gAppState.LedAvailable = TRUE;
+        gAppState.LedInformation = information;
         availableConfigCount = PopulateConfigCombo(information.CurrentConfigId);
         SendMessageW(
             gAppState.RgbCheck,
             BM_SETCHECK,
             information.UseRgbOverride ? BST_CHECKED : BST_UNCHECKED,
             0);
+        if (gAppState.FanToggleButton != nullptr)
+        {
+            SetWindowTextW(
+                gAppState.FanToggleButton,
+                (information.Effect == AW22XXX_EFFECT_FAN_LED_ON) ? L"Turn Fan Off" : L"Turn Fan On");
+        }
         chipStatus = FormatAw22ChipStatus(information);
 
         SetInfoText(
             L"Chip Status: %ls\r\n"
+            L"Fan Light: %ls\r\n"
             L"Chip ID: 0x%02x\r\n"
             L"Chip Type: %ls\r\n"
             L"Selected Config: 0x%02lx\r\n"
@@ -1310,6 +1402,7 @@ RefreshUi()
             L"Tasks: 0x%02x / 0x%02x\r\n"
             L"Flags: 0x%02x",
             chipStatus.c_str(),
+            Aw22FanStateLabel(information.Effect),
             information.ChipIdRegister,
             Aw22ChipTypeLabel(information.ChipType),
             information.CurrentConfigId,
@@ -1322,7 +1415,13 @@ RefreshUi()
     }
     else
     {
+        gAppState.LedAvailable = FALSE;
+        ZeroMemory(&gAppState.LedInformation, sizeof(gAppState.LedInformation));
         availableConfigCount = 0;
+        if (gAppState.FanToggleButton != nullptr)
+        {
+            SetWindowTextW(gAppState.FanToggleButton, L"Toggle Fan");
+        }
         SetInfoText(L"AW22 LED driver not available.");
     }
 
@@ -1402,12 +1501,51 @@ ApplySelectedConfig()
 static void
 TurnLedsOff()
 {
-    if (!SendIoctl(IOCTL_AW22XXX_LED_OFF, nullptr, 0, nullptr, 0, nullptr))
+    ULONG ledOffConfigId;
+
+    if (!FindConfigIdByName("m_led_off.bin", &ledOffConfigId))
+    {
+        SetStatusText(L"LED-off config not found: %ls", FormatWin32Error(GetLastError()).c_str());
+        return;
+    }
+
+    if (!ApplyAw22ConfigById(ledOffConfigId, FALSE))
     {
         return;
     }
 
-    SetStatusText(L"LED output disabled.");
+    if (!ApplyAw22Effect(AW22XXX_EFFECT_FAN_LED_OFF))
+    {
+        return;
+    }
+
+    SetStatusText(L"LED and fan light disabled.");
+    RefreshUi();
+}
+
+static void
+ToggleFanLight()
+{
+    UCHAR nextEffect;
+
+    if (!gAppState.LedAvailable)
+    {
+        SetStatusText(L"AW22 LED driver not available.");
+        return;
+    }
+
+    nextEffect = (gAppState.LedInformation.Effect == AW22XXX_EFFECT_FAN_LED_ON)
+        ? AW22XXX_EFFECT_FAN_LED_OFF
+        : AW22XXX_EFFECT_FAN_LED_ON;
+
+    if (!ApplyAw22Effect(nextEffect))
+    {
+        return;
+    }
+
+    SetStatusText(
+        L"Fan light turned %ls.",
+        (nextEffect == AW22XXX_EFFECT_FAN_LED_ON) ? L"on" : L"off");
     RefreshUi();
 }
 
@@ -1487,13 +1625,27 @@ CreateMainControls(
         hInst,
         nullptr);
 
-    gAppState.OffButton = CreateWindowExW(
+    gAppState.FanToggleButton = CreateWindowExW(
         0,
         L"BUTTON",
-        L"Disable LED",
+        L"Toggle Fan",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         526,
         216,
+        188,
+        32,
+        Window,
+        (HMENU)IDC_FAN_TOGGLE_BUTTON,
+        hInst,
+        nullptr);
+
+    gAppState.OffButton = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Disable LEDs",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        526,
+        256,
         188,
         32,
         Window,
@@ -1588,6 +1740,7 @@ CreateMainControls(
     ApplyFont(gAppState.ConfigCombo, gAppState.BodyFont);
     ApplyFont(gAppState.ApplyButton, gAppState.BodyFont);
     ApplyFont(gAppState.RefreshButton, gAppState.BodyFont);
+    ApplyFont(gAppState.FanToggleButton, gAppState.BodyFont);
     ApplyFont(gAppState.OffButton, gAppState.BodyFont);
     ApplyFont(gAppState.RgbCheck, gAppState.BodyFont);
     ApplyFont(gAppState.InfoText, gAppState.SmallFont);
@@ -1843,6 +1996,10 @@ WndProc(
             CloseDeviceHandle();
             CloseTouchDeviceHandle();
             RefreshUi();
+            return 0;
+
+        case IDC_FAN_TOGGLE_BUTTON:
+            ToggleFanLight();
             return 0;
 
         case IDC_OFF_BUTTON:
