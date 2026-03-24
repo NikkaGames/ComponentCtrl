@@ -48,6 +48,8 @@
 #define PICKER_ITEM_HEIGHT 36
 #define PICKER_MAX_VISIBLE_ITEMS 8
 #define PICKER_DRAG_THRESHOLD 6
+#define PICKER_SCROLLBAR_WIDTH 16
+#define PICKER_SCROLLBAR_MIN_THUMB_HEIGHT 28
 #define MI_WP_SIGNATURE 0xFF515700
 #define MI_WP_SIGNATURE_MASK 0xFFFFFF00
 
@@ -117,9 +119,11 @@ typedef struct _PICKER_STATE {
     INT TopIndex;
     BOOL Tracking;
     BOOL Dragging;
+    BOOL ScrollbarDragging;
     DWORD ContactId;
     POINT StartPoint;
     INT StartTopIndex;
+    INT ThumbDragOffset;
 } PICKER_STATE, *PPICKER_STATE;
 
 static PICKER_STATE gPickerState = {};
@@ -509,10 +513,12 @@ ResetPickerTracking()
 
     gPickerState.Tracking = FALSE;
     gPickerState.Dragging = FALSE;
+    gPickerState.ScrollbarDragging = FALSE;
     gPickerState.ContactId = 0;
     gPickerState.StartPoint.x = 0;
     gPickerState.StartPoint.y = 0;
     gPickerState.StartTopIndex = 0;
+    gPickerState.ThumbDragOffset = 0;
 }
 
 static BOOL
@@ -583,6 +589,12 @@ GetPickerVisibleCount()
 }
 
 static INT
+GetPickerScrollbarWidth()
+{
+    return (gPickerState.Items.size() > (size_t)GetPickerVisibleCount()) ? PICKER_SCROLLBAR_WIDTH : 0;
+}
+
+static INT
 GetPickerMaxTopIndex()
 {
     return max((INT)gPickerState.Items.size() - GetPickerVisibleCount(), 0);
@@ -591,23 +603,105 @@ GetPickerMaxTopIndex()
 static void
 UpdatePickerScrollBar()
 {
-    SCROLLINFO si;
+    gPickerState.TopIndex = ClampInt(gPickerState.TopIndex, 0, GetPickerMaxTopIndex());
+}
 
-    if (gPickerState.Window == nullptr)
+static RECT
+GetPickerScrollbarRect()
+{
+    RECT clientRect;
+
+    ZeroMemory(&clientRect, sizeof(clientRect));
+    if ((gPickerState.Window == nullptr) || (GetPickerScrollbarWidth() == 0))
+    {
+        return clientRect;
+    }
+
+    GetClientRect(gPickerState.Window, &clientRect);
+    clientRect.left = max(clientRect.right - GetPickerScrollbarWidth(), clientRect.left);
+    return clientRect;
+}
+
+static RECT
+GetPickerThumbRect()
+{
+    RECT scrollRect;
+    RECT thumbRect;
+    INT maxTop;
+    INT visibleCount;
+    INT itemCount;
+    INT trackHeight;
+    INT thumbHeight;
+    INT thumbTop;
+
+    ZeroMemory(&thumbRect, sizeof(thumbRect));
+    scrollRect = GetPickerScrollbarRect();
+    if ((scrollRect.right <= scrollRect.left) || (scrollRect.bottom <= scrollRect.top))
+    {
+        return thumbRect;
+    }
+
+    maxTop = GetPickerMaxTopIndex();
+    visibleCount = GetPickerVisibleCount();
+    itemCount = (INT)gPickerState.Items.size();
+    trackHeight = scrollRect.bottom - scrollRect.top;
+    thumbHeight = max(PICKER_SCROLLBAR_MIN_THUMB_HEIGHT, (trackHeight * visibleCount) / max(itemCount, 1));
+    thumbHeight = min(thumbHeight, trackHeight);
+    thumbTop = scrollRect.top;
+    if (maxTop > 0)
+    {
+        thumbTop += ((trackHeight - thumbHeight) * gPickerState.TopIndex) / maxTop;
+    }
+
+    thumbRect = scrollRect;
+    thumbRect.top = thumbTop;
+    thumbRect.bottom = min(thumbTop + thumbHeight, scrollRect.bottom);
+    thumbRect.left += 2;
+    thumbRect.right -= 2;
+    return thumbRect;
+}
+
+static BOOL
+IsPointInPickerScrollbar(
+    _In_ POINT Point
+    )
+{
+    RECT scrollRect;
+
+    scrollRect = GetPickerScrollbarRect();
+    return PtInRect(&scrollRect, Point);
+}
+
+static void
+SetPickerTopIndexFromScrollbarPoint(
+    _In_ INT PointY
+    )
+{
+    RECT scrollRect;
+    RECT thumbRect;
+    INT maxTop;
+    INT thumbHeight;
+    INT range;
+    INT thumbTop;
+
+    scrollRect = GetPickerScrollbarRect();
+    if ((scrollRect.right <= scrollRect.left) || (scrollRect.bottom <= scrollRect.top))
     {
         return;
     }
 
-    gPickerState.TopIndex = ClampInt(gPickerState.TopIndex, 0, GetPickerMaxTopIndex());
-    ZeroMemory(&si, sizeof(si));
-    si.cbSize = sizeof(si);
-    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-    si.nMin = 0;
-    si.nMax = max((INT)gPickerState.Items.size() - 1, 0);
-    si.nPage = (UINT)GetPickerVisibleCount();
-    si.nPos = gPickerState.TopIndex;
-    SetScrollInfo(gPickerState.Window, SB_VERT, &si, TRUE);
-    ShowScrollBar(gPickerState.Window, SB_VERT, gPickerState.Items.size() > (size_t)GetPickerVisibleCount());
+    maxTop = GetPickerMaxTopIndex();
+    if (maxTop <= 0)
+    {
+        gPickerState.TopIndex = 0;
+        return;
+    }
+
+    thumbRect = GetPickerThumbRect();
+    thumbHeight = max(thumbRect.bottom - thumbRect.top, PICKER_SCROLLBAR_MIN_THUMB_HEIGHT);
+    range = max((scrollRect.bottom - scrollRect.top) - thumbHeight, 1);
+    thumbTop = ClampInt(PointY - gPickerState.ThumbDragOffset, scrollRect.top, scrollRect.bottom - thumbHeight);
+    gPickerState.TopIndex = ClampInt(((thumbTop - scrollRect.top) * maxTop) / range, 0, maxTop);
 }
 
 static std::wstring
@@ -858,7 +952,7 @@ OpenPickerPopup(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         PICKER_POPUP_CLASS_NAME,
         nullptr,
-        WS_POPUP | WS_BORDER | WS_VSCROLL,
+        WS_POPUP | WS_BORDER,
         popupX,
         popupY,
         popupWidth,
@@ -941,7 +1035,7 @@ PickerPopupWndProc(
                 index * PICKER_ITEM_HEIGHT,
                 clientRect.right,
                 (index + 1) * PICKER_ITEM_HEIGHT);
-            itemRect.right = clientRect.right - ((gPickerState.Items.size() > (size_t)visibleCount) ? GetSystemMetrics(SM_CXVSCROLL) : 0);
+            itemRect.right = clientRect.right - GetPickerScrollbarWidth();
 
             if (itemIndex == gPickerState.SelectedIndex)
             {
@@ -957,6 +1051,23 @@ PickerPopupWndProc(
             itemRect.left += 12;
             itemRect.right -= 12;
             DrawTextW(memoryDc, gPickerState.Items[(size_t)itemIndex].Label.c_str(), -1, &itemRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+
+        if (GetPickerScrollbarWidth() > 0)
+        {
+            RECT scrollRect;
+            RECT thumbRect;
+            HBRUSH trackBrush;
+            HBRUSH thumbBrush;
+
+            scrollRect = GetPickerScrollbarRect();
+            thumbRect = GetPickerThumbRect();
+            trackBrush = CreateSolidBrush(RGB(239, 243, 247));
+            thumbBrush = CreateSolidBrush(RGB(170, 182, 198));
+            FillRect(memoryDc, &scrollRect, trackBrush);
+            FillRect(memoryDc, &thumbRect, thumbBrush);
+            DeleteObject(trackBrush);
+            DeleteObject(thumbBrush);
         }
 
         BitBlt(
@@ -987,45 +1098,6 @@ PickerPopupWndProc(
         }
         return 0;
 
-    case WM_VSCROLL:
-    {
-        SCROLLINFO si;
-        INT newPos;
-
-        ZeroMemory(&si, sizeof(si));
-        si.cbSize = sizeof(si);
-        si.fMask = SIF_ALL;
-        GetScrollInfo(Window, SB_VERT, &si);
-        newPos = gPickerState.TopIndex;
-
-        switch (LOWORD(WParam))
-        {
-        case SB_LINEUP:
-            newPos--;
-            break;
-        case SB_LINEDOWN:
-            newPos++;
-            break;
-        case SB_PAGEUP:
-            newPos -= GetPickerVisibleCount();
-            break;
-        case SB_PAGEDOWN:
-            newPos += GetPickerVisibleCount();
-            break;
-        case SB_THUMBPOSITION:
-        case SB_THUMBTRACK:
-            newPos = si.nTrackPos;
-            break;
-        default:
-            return 0;
-        }
-
-        gPickerState.TopIndex = ClampInt(newPos, 0, GetPickerMaxTopIndex());
-        UpdatePickerScrollBar();
-        InvalidateRect(Window, nullptr, TRUE);
-        return 0;
-    }
-
     case WM_MOUSEWHEEL:
     {
         short wheelDelta;
@@ -1049,6 +1121,7 @@ PickerPopupWndProc(
     {
         POINTER_INPUT_TYPE pointerType;
         POINT point;
+        RECT thumbRect;
 
         if (!GetPointerType(GET_POINTERID_WPARAM(WParam), &pointerType)
             || ((pointerType != PT_TOUCH) && (pointerType != PT_PEN)))
@@ -1059,8 +1132,30 @@ PickerPopupWndProc(
         point.x = GET_X_LPARAM(LParam);
         point.y = GET_Y_LPARAM(LParam);
         ScreenToClient(Window, &point);
+        if (IsPointInPickerScrollbar(point))
+        {
+            thumbRect = GetPickerThumbRect();
+            gPickerState.Tracking = TRUE;
+            gPickerState.Dragging = TRUE;
+            gPickerState.ScrollbarDragging = TRUE;
+            gPickerState.ContactId = GET_POINTERID_WPARAM(WParam);
+            gPickerState.StartPoint = point;
+            gPickerState.StartTopIndex = gPickerState.TopIndex;
+            gPickerState.ThumbDragOffset = point.y - thumbRect.top;
+            if (!PtInRect(&thumbRect, point) || (gPickerState.ThumbDragOffset < 0))
+            {
+                gPickerState.ThumbDragOffset = max((thumbRect.bottom - thumbRect.top) / 2, 0);
+            }
+            SetPickerTopIndexFromScrollbarPoint(point.y);
+            UpdatePickerScrollBar();
+            InvalidateRect(Window, nullptr, TRUE);
+            SetCapture(Window);
+            return 0;
+        }
+
         gPickerState.Tracking = TRUE;
         gPickerState.Dragging = FALSE;
+        gPickerState.ScrollbarDragging = FALSE;
         gPickerState.ContactId = GET_POINTERID_WPARAM(WParam);
         gPickerState.StartPoint = point;
         gPickerState.StartTopIndex = gPickerState.TopIndex;
@@ -1084,6 +1179,13 @@ PickerPopupWndProc(
             point.x = GET_X_LPARAM(LParam);
             point.y = GET_Y_LPARAM(LParam);
             ScreenToClient(Window, &point);
+            if (gPickerState.ScrollbarDragging)
+            {
+                SetPickerTopIndexFromScrollbarPoint(point.y);
+                UpdatePickerScrollBar();
+                InvalidateRect(Window, nullptr, TRUE);
+                return 0;
+            }
             deltaY = point.y - gPickerState.StartPoint.y;
             if (!gPickerState.Dragging && (abs(deltaY) >= PICKER_DRAG_THRESHOLD))
             {
@@ -1113,6 +1215,11 @@ PickerPopupWndProc(
             point.x = GET_X_LPARAM(LParam);
             point.y = GET_Y_LPARAM(LParam);
             ScreenToClient(Window, &point);
+            if (gPickerState.ScrollbarDragging)
+            {
+                ResetPickerTracking();
+                return 0;
+            }
             wasDragging = gPickerState.Dragging;
             ResetPickerTracking();
             if (!wasDragging)
@@ -1132,14 +1239,36 @@ PickerPopupWndProc(
         {
             return 0;
         }
-        
+
     {
         POINT point;
+        RECT thumbRect;
 
         point.x = GET_X_LPARAM(LParam);
         point.y = GET_Y_LPARAM(LParam);
+        if (IsPointInPickerScrollbar(point))
+        {
+            thumbRect = GetPickerThumbRect();
+            gPickerState.Tracking = TRUE;
+            gPickerState.Dragging = TRUE;
+            gPickerState.ScrollbarDragging = TRUE;
+            gPickerState.StartPoint = point;
+            gPickerState.StartTopIndex = gPickerState.TopIndex;
+            gPickerState.ThumbDragOffset = point.y - thumbRect.top;
+            if (!PtInRect(&thumbRect, point) || (gPickerState.ThumbDragOffset < 0))
+            {
+                gPickerState.ThumbDragOffset = max((thumbRect.bottom - thumbRect.top) / 2, 0);
+            }
+            SetPickerTopIndexFromScrollbarPoint(point.y);
+            UpdatePickerScrollBar();
+            InvalidateRect(Window, nullptr, TRUE);
+            SetCapture(Window);
+            return 0;
+        }
+
         gPickerState.Tracking = TRUE;
         gPickerState.Dragging = FALSE;
+        gPickerState.ScrollbarDragging = FALSE;
         gPickerState.StartPoint = point;
         gPickerState.StartTopIndex = gPickerState.TopIndex;
         SetCapture(Window);
@@ -1159,6 +1288,13 @@ PickerPopupWndProc(
 
             point.x = GET_X_LPARAM(LParam);
             point.y = GET_Y_LPARAM(LParam);
+            if (gPickerState.ScrollbarDragging)
+            {
+                SetPickerTopIndexFromScrollbarPoint(point.y);
+                UpdatePickerScrollBar();
+                InvalidateRect(Window, nullptr, TRUE);
+                return 0;
+            }
             deltaY = point.y - gPickerState.StartPoint.y;
             if (!gPickerState.Dragging && (abs(deltaY) >= PICKER_DRAG_THRESHOLD))
             {
@@ -1192,6 +1328,11 @@ PickerPopupWndProc(
 
             point.x = GET_X_LPARAM(LParam);
             point.y = GET_Y_LPARAM(LParam);
+            if (gPickerState.ScrollbarDragging)
+            {
+                ResetPickerTracking();
+                return 0;
+            }
             wasDragging = gPickerState.Dragging;
             ResetPickerTracking();
             if (!wasDragging)
@@ -1237,11 +1378,28 @@ PickerPopupWndProc(
 
                 if ((touch->dwFlags & TOUCHEVENTF_DOWN) != 0)
                 {
+                    RECT thumbRect;
+
                     gPickerState.Tracking = TRUE;
                     gPickerState.Dragging = FALSE;
+                    gPickerState.ScrollbarDragging = FALSE;
                     gPickerState.ContactId = touch->dwID;
                     gPickerState.StartPoint = point;
                     gPickerState.StartTopIndex = gPickerState.TopIndex;
+                    if (IsPointInPickerScrollbar(point))
+                    {
+                        thumbRect = GetPickerThumbRect();
+                        gPickerState.Dragging = TRUE;
+                        gPickerState.ScrollbarDragging = TRUE;
+                        gPickerState.ThumbDragOffset = point.y - thumbRect.top;
+                        if (!PtInRect(&thumbRect, point) || (gPickerState.ThumbDragOffset < 0))
+                        {
+                            gPickerState.ThumbDragOffset = max((thumbRect.bottom - thumbRect.top) / 2, 0);
+                        }
+                        SetPickerTopIndexFromScrollbarPoint(point.y);
+                        UpdatePickerScrollBar();
+                        InvalidateRect(Window, nullptr, TRUE);
+                    }
                     SetCapture(Window);
                     handled = TRUE;
                 }
@@ -1250,6 +1408,15 @@ PickerPopupWndProc(
                     if (gPickerState.Tracking && (gPickerState.ContactId == touch->dwID))
                     {
                         INT deltaY;
+
+                        if (gPickerState.ScrollbarDragging)
+                        {
+                            SetPickerTopIndexFromScrollbarPoint(point.y);
+                            UpdatePickerScrollBar();
+                            InvalidateRect(Window, nullptr, TRUE);
+                            handled = TRUE;
+                            continue;
+                        }
 
                         deltaY = point.y - gPickerState.StartPoint.y;
                         if (!gPickerState.Dragging && (abs(deltaY) >= PICKER_DRAG_THRESHOLD))
@@ -1275,6 +1442,13 @@ PickerPopupWndProc(
                     if (gPickerState.Tracking && (gPickerState.ContactId == touch->dwID))
                     {
                         BOOL wasDragging;
+
+                        if (gPickerState.ScrollbarDragging)
+                        {
+                            ResetPickerTracking();
+                            handled = TRUE;
+                            continue;
+                        }
 
                         wasDragging = gPickerState.Dragging;
                         ResetPickerTracking();
